@@ -7,9 +7,9 @@
 #define TPWRTX_MAGIC        0x58525054u /* 'TPRX' */
 #define TPWRTX_VERSION      1u
 #define TPWRTX_SLOTS        3u
-#define TPWRTX_MAX_DRAWS    8192u
-#define TPWRTX_MAX_VERTS    (192u * 1024u)
-#define TPWRTX_MAX_INDICES  (384u * 1024u)
+#define TPWRTX_MAX_DRAWS    16384u
+#define TPWRTX_MAX_VERTS    (384u * 1024u)   /* zoomed far out the game draws a lot more */
+#define TPWRTX_MAX_INDICES  (768u * 1024u)
 #define TPWRTX_MAX_TEX      4096u
 #define TPWRTX_TEX_HEAP     (64u * 1024u * 1024u)   /* BGRA8 pixels; ~25 MB used by the game's 256px texture cache.
                                                        ponytail: kept small, the mapping lives in a 32-bit address space */
@@ -68,6 +68,10 @@ typedef struct {
     volatile uint32_t outFenceValue;                  /* fence value the renderer signals once the latest frame is in the texture */
     volatile uint32_t outVisible;                     /* show it now (ray tracing a park and not toggled off) */
     volatile uint32_t uiOpen;                         /* renderer's settings panel is open: hook releases the game's mouse/keyboard */
+    /* Camera options from the settings panel, applied by the hook (0 = renderer not up yet: keep the game's own) */
+    volatile float camFov;                            /* nominal game FOV, 90 = original */
+    volatile float camZoomMin, camZoomMax;            /* camera distance limits, original 70..130 */
+    volatile uint32_t camWasd;                        /* 1 = WASD pan + Q/E rotate */
     TpwTexture tex[TPWRTX_MAX_TEX];
     TpwFrameSlot slots[TPWRTX_SLOTS];
     uint8_t texHeap[TPWRTX_TEX_HEAP];

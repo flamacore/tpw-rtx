@@ -36,7 +36,7 @@ static FILE *g_log;
 static void fail(const char *what, HRESULT hr) { fprintf(g_log, "FATAL %s hr=%08lx\n", what, (unsigned long)hr); fflush(g_log); ExitProcess(1); }
 #define CHECK(x) do { HRESULT hr_ = (x); if (FAILED(hr_)) fail(#x, hr_); } while (0)
 
-static UINT WIN_W = 1280, WIN_H = 960;   // internal render size (tpwrtx.ini "height", width = 4:3)
+static UINT WIN_W = 1280, WIN_H = 960;   // internal render size (tpwrtx.ini "height"; width from the game aspect, 4:3 or "resolution")
 static const UINT BUFS = 3;
 static const uint32_t CACHE_MAX_TRIS = 400000;
 static const uint32_t RT_MAX_TRIS = TPWRTX_MAX_INDICES / 3 + CACHE_MAX_TRIS, MAX_LIGHTS = 64;
@@ -155,12 +155,18 @@ static Setting g_set[] = {
     {"nrIntensity", "DLSS 5 intensity", 1.0f, 0.0f, 2.0f},
     {"nrStructure", "DLSS 5 local structure", 1.0f, 0.0f, 2.0f},
     {"nrTone", "DLSS 5 local tone", 1.0f, 0.0f, 2.0f},
+    // Game camera (applied by the hook inside TP.EXE). The game's pitch follows the zoom: closer = lower, farther = top-down.
+    {"fov", "Camera FOV (90 = original)", 90, 50, 130, true},
+    {"zoomMin", "Closest zoom (70 = original)", 40, 15, 70, true},
+    {"zoomMax", "Farthest zoom (130 = original)", 200, 130, 400, true},
+    {"wasd", "WASD pan, Q/E rotate", 1, 0, 1, true},
 };
 static const char *const kNrStyleNames[] = {"Default", "Natural", "Cinematic"};
 static const char *const kDlssNames[] = {"off (own denoiser)", "DLAA (native)", "Quality", "Balanced", "Performance"};
 enum { ST_EXPOSURE, ST_CONTRAST, ST_SATURATION, ST_SUN, ST_SUNAZ, ST_SUNEL, ST_SUNSOFT, ST_SKY, ST_BOUNCE, ST_TORCH, ST_TINT, ST_SHADE,
        ST_NORMAL, ST_SPEC, ST_GLOSS, ST_DENOISE, ST_DNSMOOTH, ST_HISTORY, ST_JITTER, ST_DLSS,
-       ST_NR, ST_NRSTRENGTH, ST_NRCOLOUR, ST_NRGUARD, ST_NRSTYLE, ST_NRPRESET, ST_NRINTENSITY, ST_NRSTRUCTURE, ST_NRTONE, ST_COUNT };
+       ST_NR, ST_NRSTRENGTH, ST_NRCOLOUR, ST_NRGUARD, ST_NRSTYLE, ST_NRPRESET, ST_NRINTENSITY, ST_NRSTRUCTURE, ST_NRTONE,
+       ST_FOV, ST_ZOOMMIN, ST_ZOOMMAX, ST_WASD, ST_COUNT };
 static_assert(ST_COUNT == sizeof g_set / sizeof g_set[0], "settings table and enum out of sync");
 static float S(int i) { return g_set[i].v; }
 static const char *SETTINGS_FILE = "tpwrtx_settings.json";
@@ -196,7 +202,7 @@ static void label_text(int i)
 {
     wchar_t t[96];
     if (i == ST_DLSS) swprintf(t, 96, L"DLSS RR:  %hs", kDlssNames[std::clamp((int)g_set[i].v, 0, 4)]);
-    else if (i == ST_NR) swprintf(t, 96, L"%hs:  %hs", g_set[i].label, g_set[i].v > 0.5f ? "on" : "off");
+    else if (i == ST_NR || i == ST_WASD) swprintf(t, 96, L"%hs:  %hs", g_set[i].label, g_set[i].v > 0.5f ? "on" : "off");
     else if (i == ST_NRSTYLE) swprintf(t, 96, L"%hs:  %hs", g_set[i].label, kNrStyleNames[std::clamp((int)g_set[i].v, 0, 2)]);
     else swprintf(t, 96, g_set[i].integer ? L"%hs:  %.0f" : L"%hs:  %.2f", g_set[i].label, g_set[i].v);
     SetWindowTextW(g_lbl[i], t);
@@ -268,8 +274,9 @@ static void panel_create(HINSTANCE inst)
     RegisterClassW(&wc);
     UINT dpi = GetDpiForSystem();
     auto px = [&](int v) { return MulDiv(v, dpi, 96); };
-    int pad = px(10), rowH = px(30), lw = px(200), tw = px(240), bw = px(100), bh = px(26);
-    int cw = pad * 3 + lw + tw, ch = pad * 2 + rowH * ST_COUNT + bh + px(6);
+    int pad = px(10), rowH = px(30), lw = px(210), tw = px(230), bw = px(100), bh = px(26);
+    int rows = (ST_COUNT + 1) / 2, colW = pad * 2 + lw + tw;   // two columns: one would not fit a 1440p screen at 150%
+    int cw = pad + colW * 2, ch = pad * 2 + rowH * rows + bh + px(6);
     DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     RECT r{0, 0, cw, ch};
     AdjustWindowRectExForDpi(&r, style, FALSE, WS_EX_TOOLWINDOW, dpi);
@@ -279,13 +286,13 @@ static void panel_create(HINSTANCE inst)
     SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0, dpi);
     HFONT font = CreateFontIndirectW(&ncm.lfMessageFont);
     for (int i = 0; i < ST_COUNT; i++) {
-        int y = pad + i * rowH;
-        g_lbl[i] = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, pad, y + px(6), lw, rowH - px(6), g_panel, nullptr, inst, nullptr);
-        g_tb[i] = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS, pad * 2 + lw, y, tw, rowH, g_panel, nullptr, inst, nullptr);
+        int y = pad + (i % rows) * rowH, x = pad + (i / rows) * colW;
+        g_lbl[i] = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, x, y + px(6), lw, rowH - px(6), g_panel, nullptr, inst, nullptr);
+        g_tb[i] = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS, x + pad + lw, y, tw, rowH, g_panel, nullptr, inst, nullptr);
         SendMessageW(g_tb[i], TBM_SETRANGE, TRUE, MAKELPARAM(0, g_set[i].integer ? (int)(g_set[i].hi - g_set[i].lo) : 1000));
         SendMessageW(g_lbl[i], WM_SETFONT, (WPARAM)font, TRUE);
     }
-    int by = pad + rowH * ST_COUNT + px(4);
+    int by = pad + rowH * rows + px(4);
     HWND b1 = CreateWindowExW(0, L"BUTTON", L"Defaults", WS_CHILD | WS_VISIBLE, pad, by, bw, bh, g_panel, (HMENU)1, inst, nullptr);
     HWND b2 = CreateWindowExW(0, L"BUTTON", L"Close", WS_CHILD | WS_VISIBLE, cw - pad - bw, by, bw, bh, g_panel, (HMENU)2, inst, nullptr);
     SendMessageW(b1, WM_SETFONT, (WPARAM)font, TRUE); SendMessageW(b2, WM_SETFONT, (WPARAM)font, TRUE);
@@ -1234,21 +1241,31 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
         } else pid = strtoul(__argv[i], nullptr, 10);
     }
     HANDLE game = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : nullptr;
-    if (FILE *ini = fopen("tpwrtx.ini", "r")) {   // overlay = 1, height = 1440
+    if (FILE *ini = fopen("tpwrtx.ini", "r")) {   // overlay = 1, height = 1440 | auto, resolution = 2560x1440 | auto
         char line[128];
+        UINT aw = 4, ah = 3, h = WIN_H;
+        bool hAuto = false;
         while (fgets(line, sizeof line, ini)) {
-            int v;
-            if (sscanf(line, " overlay = %d", &v) == 1) g_overlay = v != 0;
-            if (sscanf(line, " height = %d", &v) == 1 && v >= 480 && v <= 2160) { WIN_H = (UINT)v & ~7u; WIN_W = WIN_H * 4 / 3; }
-            else if (strstr(line, "height") && strstr(line, "auto")) {   // the game window's client height (hook fits it to the work area)
-                RECT wa, fr{0, 0, 100, 100};
-                SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);
-                AdjustWindowRect(&fr, WS_OVERLAPPEDWINDOW, FALSE);
-                v = std::clamp((int)(wa.bottom - wa.top) - (int)(fr.bottom - fr.top - 100), 480, 2160);
-                WIN_H = (UINT)v & ~7u; WIN_W = WIN_H * 4 / 3;
-            }
+            int v; UINT rw, rh;
+            const char *p = line + strspn(line, " \t");
+            if (*p == ';' || *p == '#') continue;
+            if (sscanf(p, "overlay = %d", &v) == 1) g_overlay = v != 0;
+            if (sscanf(p, "height = %d", &v) == 1 && v >= 480 && v <= 2160) h = (UINT)v;
+            else if (!strncmp(p, "height", 6) && strstr(p, "auto")) hAuto = true;   // the game window's client size (the hook fits it to the work area)
+            // widescreen: same aspect as the game's resolution (the hook patches the game to it)
+            if (sscanf(p, "resolution = %ux%u", &rw, &rh) == 2 && rh >= 480 && rw >= rh) { aw = rw; ah = rh; }
+            else if (!strncmp(p, "resolution", 10) && strstr(p, "auto")) { aw = GetSystemMetrics(SM_CXSCREEN); ah = GetSystemMetrics(SM_CYSCREEN); }
         }
         fclose(ini);
+        if (hAuto) {
+            RECT wa, fr{0, 0, 100, 100};
+            SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);
+            AdjustWindowRect(&fr, WS_OVERLAPPEDWINDOW, FALSE);
+            int ww = (int)(wa.right - wa.left) - (int)(fr.right - fr.left - 100), wh = (int)(wa.bottom - wa.top) - (int)(fr.bottom - fr.top - 100);
+            h = (UINT)std::min(wh, (int)((INT64)ww * ah / aw));
+        }
+        WIN_H = std::clamp(h, 480u, 2160u) & ~7u;
+        WIN_W = (UINT)((UINT64)WIN_H * aw / ah) & ~7u;
     }
     fprintf(g_log, "render %ux%u, %s\n", WIN_W, WIN_H, g_overlay ? "overlay over the game" : "window");
 
@@ -1316,6 +1333,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
             }
         }
         bool have = read_frame(sh, fr) && fr.hdr.width;
+        sh->camZoomMin = S(ST_ZOOMMIN); sh->camZoomMax = S(ST_ZOOMMAX); sh->camWasd = S(ST_WASD) > 0.5f;
+        sh->camFov = S(ST_FOV);   // last: the hook starts applying camera options once this is set
         if (GetFileAttributesA("tpwrtx_shot") != INVALID_FILE_ATTRIBUTES) { DeleteFileA("tpwrtx_shot"); g_in.shot = true; }
         read_cmd_file();
         if (g_dumpTex && g_dumpTex <= sh->texCount && sh->tex[g_dumpTex - 1].width) {

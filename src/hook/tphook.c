@@ -14,6 +14,7 @@
 #include <dsound.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <math.h>
 #include "../shared/tpwrtx_shared.h"
 
 /* Camera globals in TP.EXE (fixed image base 0x400000), found in Phase 2 */
@@ -142,27 +143,35 @@ static void log_movie_state(void)
     logf_("[movie] wait=%lu enabled=%lu player=%08lx state=%lu f3e0=%lu dsbuf=%08lx pos=%lu/%lu hr=%08lx\n", waiting, enabled, m, state, f3e0, buf, play, write, hr);
 }
 
-/* Windowed mode (dxwrapper): the game sizes its window to the whole screen (16:9) and dxwrapper stretches the 4:3
- * picture to fill it. Keep the window at the largest centred 4:3 client area that fits the monitor's work area. */
+/* Game resolution: 0 = the game's own (4:3 modes); else tpwrtx.ini [tpwrtx] resolution = WxH | auto (widescreen) */
+static DWORD g_resW, g_resH;
+static DWORD g_peakDraws, g_peakVerts, g_dropped;   /* per-frame stream usage, logged every 600 frames */
+static float g_viewRadius = 460;                     /* see cam_patch */
+
+/* Windowed mode (dxwrapper): the game sizes its window to the whole screen and dxwrapper stretches the picture to fill
+ * it. Keep the window at the largest centred client area of the game's aspect (4:3, or the widescreen resolution)
+ * that fits the monitor's work area. */
 static void keep_window_4x3(void)
 {
     HWND w = NULL;
     RECT c, r;
     MONITORINFO mi = {sizeof mi};
-    LONG style, ex, ch, cw;
+    LONG style, ex, ch, cw, fw, fh, aw = g_resW ? (LONG)g_resW : 4, ah = g_resW ? (LONG)g_resH : 3;
     EnumWindows(find_game_wnd, (LPARAM)&w);
     if (!w || IsIconic(w) || !GetClientRect(w, &c) || !c.bottom) return;
-    if (labs(c.right * 3 - c.bottom * 4) <= c.bottom / 50) return;   /* already 4:3 (2% tolerance) */
+    if (labs(c.right * ah - c.bottom * aw) <= c.bottom * aw / ah / 50) return;   /* already the right aspect (2% tolerance) */
     style = GetWindowLongA(w, GWL_STYLE); ex = GetWindowLongA(w, GWL_EXSTYLE);
     if (!(style & WS_CAPTION)) return;                                /* not windowed (e.g. DDrawCompat fullscreen) */
     GetMonitorInfoA(MonitorFromWindow(w, MONITOR_DEFAULTTOPRIMARY), &mi);
     r.left = r.top = 0; r.right = r.bottom = 100;
     AdjustWindowRectEx(&r, style, FALSE, ex);                         /* frame size = r minus the 100x100 client */
-    ch = (mi.rcWork.bottom - mi.rcWork.top) - (r.bottom - r.top - 100);
-    cw = ch * 4 / 3;
-    SetWindowPos(w, NULL, mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - cw - (r.right - r.left - 100)) / 2, mi.rcWork.top,
-                 cw + (r.right - r.left - 100), ch + (r.bottom - r.top - 100), SWP_NOZORDER | SWP_NOACTIVATE);
-    logf_("window: client %ldx%ld -> %ldx%ld (4:3)\n", c.right, c.bottom, cw, ch);
+    fw = r.right - r.left - 100; fh = r.bottom - r.top - 100;
+    ch = (mi.rcWork.bottom - mi.rcWork.top) - fh;
+    cw = ch * aw / ah;
+    if (cw > (mi.rcWork.right - mi.rcWork.left) - fw) { cw = (mi.rcWork.right - mi.rcWork.left) - fw; ch = cw * ah / aw; }
+    SetWindowPos(w, NULL, mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - cw - fw) / 2, mi.rcWork.top,
+                 cw + fw, ch + fh, SWP_NOZORDER | SWP_NOACTIVATE);
+    logf_("window: client %ldx%ld -> %ldx%ld (%ld:%ld)\n", c.right, c.bottom, cw, ch, aw, ah);
 }
 
 static DWORD WINAPI watchdog(LPVOID unused)
@@ -235,8 +244,19 @@ static void stream_begin(void)
     MemoryBarrier();
     s->h.frame = g_frame;
     memcpy(s->h.view, GAME_VIEW, 64); memcpy(s->h.camInv, GAME_CAMINV, 64);
-    /* ponytail: projection measured at 2048x1536 (tools/calibrate.py); assumed to scale with resolution */
-    s->h.f = 1535.3f * g_W / 2048; s->h.k = 1.4142f; s->h.cx = 1023.8f * g_W / 2048; s->h.cy = 767.7f * g_H / 1536;
+    /* Engine projection (FUN_00578be0 + screen matrix 0x87b0d0): w = z*sin(fov/2), sx = cx + x/z * cot(fov/2) * aspect*(W-1).
+     * At the original fov 90 / aspect 0.75 / 2048 wide that is f = 1535.25, k = 1.4142: what tools/calibrate.py measured. */
+    {
+        float fov = 90, asp = 0.75f, t;
+        if (g_knownExe) {
+            fov = *(volatile float *)0x87af58; asp = *(volatile float *)0x8bcbcc;
+            if (!(fov >= 20 && fov <= 170)) fov = 90;
+            if (!(asp > 0.2f && asp < 2)) asp = 0.75f;
+        }
+        t = (float)tan(fov * 0.5 * 3.14159265 / 180);
+        s->h.f = (g_W - 1) * asp / t; s->h.k = (float)sqrt(1 + t * t) / t;
+        s->h.cx = 1023.8f * g_W / 2048; s->h.cy = 767.7f * g_H / 1536;
+    }
     s->h.width = g_W; s->h.height = g_H;
     s->h.numDraws = s->h.numVertices = s->h.numIndices = 0;
     g_slot = s;
@@ -259,8 +279,11 @@ static void stream_draw(const TpwVertex *v, DWORD nv, const WORD *idx, DWORD ni)
     TpwDraw *d;
     DWORD i;
     float maxz = 0;
-    if (!s || s->h.numDraws >= TPWRTX_MAX_DRAWS || s->h.numVertices + nv > TPWRTX_MAX_VERTS || s->h.numIndices + ni > TPWRTX_MAX_INDICES) return;
+    if (!s) return;
+    if (s->h.numDraws >= TPWRTX_MAX_DRAWS || s->h.numVertices + nv > TPWRTX_MAX_VERTS || s->h.numIndices + ni > TPWRTX_MAX_INDICES) { g_dropped++; return; }
     d = &s->draws[s->h.numDraws++];
+    if (s->h.numDraws > g_peakDraws) g_peakDraws = s->h.numDraws;
+    if (s->h.numVertices + nv > g_peakVerts) g_peakVerts = s->h.numVertices + nv;
     d->firstVertex = s->h.numVertices; d->numVertices = nv; d->firstIndex = s->h.numIndices; d->numIndices = ni;
     memcpy(&s->verts[s->h.numVertices], v, nv * sizeof(TpwVertex));
     if (idx) memcpy(&s->indices[s->h.numIndices], idx, ni * 2);
@@ -499,6 +522,7 @@ static void make_arrow(void)
 }
 
 static void di_reacquire(void);
+static void cam_frame(void);
 
 static void stream_cursor(void)
 {
@@ -533,6 +557,7 @@ static void stream_cursor(void)
 static HRESULT WINAPI h_EndScene(LPDIRECT3DDEVICE3 d)
 {
     di_reacquire();
+    cam_frame();
     stream_cursor();
     stream_end();
     /* show the renderer's latest frame on the game window (overlay mode). The game's own pointer is streamed by
@@ -540,9 +565,12 @@ static HRESULT WINAPI h_EndScene(LPDIRECT3DDEVICE3 d)
     if (g_sh) overlay_frame(g_sh);
     if (g_bin) { fclose(g_bin); g_bin = NULL; }
     if (g_frame % 600 == 0) {
-        logf_("frame %lu: %lu draws; textures %lu captured, %lu lock failures, %lu ids, heap %lu KB\n", g_frame, g_frameDraws,
+        logf_("frame %lu: %lu draws (peak %lu draws / %lu vertices since last line, %lu dropped); zoom %.0f, draw area %.0f; "
+              "textures %lu captured, %lu lock failures, %lu ids, heap %lu KB\n", g_frame, g_frameDraws, g_peakDraws, g_peakVerts,
+              g_dropped, g_knownExe ? *(volatile float *)0x7909ec : 0, g_viewRadius,
               g_texCaptures, g_texFails, g_sh ? g_sh->texCount : 0, g_sh ? g_sh->texHeapUsed >> 10 : 0);
         fflush(g_log);
+        g_peakDraws = g_peakVerts = g_dropped = 0;
     }
     g_frame++; g_frameDraws = 0;
     return o_EndScene(d);
@@ -990,6 +1018,170 @@ static void hook_didevice(void *dev)
     logf_("dinput: hooked device vtable %p (re-acquire on input lost)\n", vt);
 }
 
+/* ================= camera & screen options (supported TP.EXE only) =================
+ * Camera: FUN_0042b1c0 every frame, FUN_0042a990 on park load. Zoom = camera distance 0x7909ec, clamped to 70..130 at
+ * 0x42c66b..0x42c6a1; the pitch follows zoom (45 deg at 70, 65 deg at 130, extrapolated beyond and capped at 84 deg).
+ * Projection: FUN_00578be0(this 0x87b110, near, far, fov in degrees) + frustum FUN_0056b790(this [0x879d54], fov), called
+ * by the camera init with fov = [0x74c9b8] (pi/2) * 57.29 = 90. Mouse picking (FUN_0045bf90) keeps its own copy of
+ * that frustum: half-diagonal angle [0x74c9b8] * 0.885 * 0.5 and the aspect as a double at [0x6fe640].
+ * Aspect 0x8bcbcc (H/W, 0.75) also feeds the screen matrix 0x87b0d0[0] = 2 * aspect.
+ * Keys: FUN_0040ca20(group, action) = is a key bound to action down. Camera group [0x787c14] (+6 = enabled; the game
+ * clears it while you type), pan actions 0xd..0x10 = numpad 8/2/4/6, rotate 6/7 = left/right arrow. */
+static float g_zoomMin = 70, g_zoomMax = 130, g_fovRad = 1.5707964f, g_pickBase = 1.5707964f;
+static double g_pickAspect = 0.75;
+static float g_fovDeg = 90, g_fovApplied, g_aspect = 0.75f;
+static BOOL g_wasd, g_camPatched;
+static WORD g_scSaved[32];
+/* FUN_0056ea90 only draws objects and terrain inside a square around the eye: side [0x8bd4c0] (view distance setting)
+ * in first-person views (0x8bcbc8 & 0x2000), else a fixed 460 (0x56eaae), just enough for zoom 130 at 4:3. The patch
+ * always takes the first branch and reads g_viewRadius instead, which cam_frame grows with zoom, FOV and screen width. */
+
+static BOOL poke(DWORD addr, DWORD expect, DWORD value)   /* expect 0 = don't check */
+{
+    DWORD old, *p = (DWORD *)addr;
+    if (expect && *p != expect) { logf_("camera: unexpected code at %08lx (%08lx), not patched\n", addr, *p); return FALSE; }
+    VirtualProtect(p, 4, PAGE_EXECUTE_READWRITE, &old);
+    *p = value;
+    VirtualProtect(p, 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 4);
+    return TRUE;
+}
+static DWORD fbits(float f) { DWORD d; memcpy(&d, &f, 4); return d; }
+static BOOL poke2(DWORD addr, WORD expect, WORD value)
+{
+    DWORD old;
+    WORD *p = (WORD *)addr;
+    if (*p != expect) { logf_("camera: unexpected code at %08lx (%04x), not patched\n", addr, *p); return FALSE; }
+    VirtualProtect(p, 2, PAGE_EXECUTE_READWRITE, &old);
+    *p = value;
+    VirtualProtect(p, 2, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 2);
+    return TRUE;
+}
+
+typedef DWORD (__fastcall *KEYTEST_t)(void *grp, void *edx, short action);       /* __thiscall, one stack argument */
+typedef void (__fastcall *PROJ_t)(void *m, void *edx, float zn, float zf, float fov);
+typedef void (__fastcall *FRUST_t)(void *f, void *edx, float fov);
+
+static DWORD __fastcall h_KeyTest(void *grp, void *edx, short action)
+{
+    DWORD r = ((KEYTEST_t)0x40ca20)(grp, edx, action);
+    int vk;
+    if ((WORD)r || !g_wasd || !*(short *)((BYTE *)grp + 6)) return r;   /* bound key down / WASD off / keys disabled (typing) */
+    switch (action) {
+    case 0xd: vk = 'W'; break;
+    case 0xe: vk = 'S'; break;
+    case 0xf: vk = 'A'; break;
+    case 0x10: vk = 'D'; break;
+    case 6: vk = 'Q'; break;
+    case 7: vk = 'E'; break;
+    default: return r;
+    }
+    if (((GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_MENU)) & 0x8000) || !game_has_focus() || ui_open()) return r;
+    return (GetAsyncKeyState(vk) & 0x8000) ? 1 : r;
+}
+
+/* WASD/Q/E would also fire the game's own one-letter shortcuts (A = all items, S = all staff): unbind those while on. */
+static void shortcuts_wasd(BOOL on)
+{
+    BYTE *grp = *(BYTE **)0x78721c, *e;
+    int i, n;
+    if (!grp || !(e = *(BYTE **)grp)) return;
+    n = *(short *)(grp + 4);
+    for (i = 0; i < n && i < 32; i++, e += 20) {
+        WORD *key = (WORD *)(e + 2);
+        if (on && !g_scSaved[i] && !*(WORD *)(e + 4) && *key < 128 && *key && strchr("WASDQE", *key)) {
+            g_scSaved[i] = *key; *key = 0;
+            logf_("camera: WASD on, game shortcut '%c' unbound\n", g_scSaved[i]);
+        } else if (!on && g_scSaved[i]) { *key = g_scSaved[i]; g_scSaved[i] = 0; }
+    }
+}
+
+static void cam_set_fov(float fovDeg)
+{
+    double t = tan(fovDeg * 0.5 * 3.14159265358979 / 180);
+    g_fovRad = (float)(fovDeg * 3.14159265358979 / 180);
+    g_pickBase = (float)(atan(t * 0.5 * sqrt(1 + 1 / ((double)g_aspect * g_aspect))) / (0.885 * 0.5));   /* 1.5700 at 90, 4:3 */
+    g_pickAspect = g_aspect;
+}
+
+static void cam_patch(void)
+{
+    static const DWORD keySites[] = {0x42b334, 0x42b364, 0x42b620, 0x42b632, 0x42b644, 0x42b656, 0x42b9a3, 0x42b9bd, 0x42b9d7, 0x42b9f1};
+    char res[32] = "";
+    BOOL ok = TRUE;
+    BYTE *p;
+    int i;
+    GetPrivateProfileStringA("tpwrtx", "resolution", "", res, sizeof res, ".\\tpwrtx.ini");
+    if (!_stricmp(res, "auto")) { g_resW = GetSystemMetrics(SM_CXSCREEN); g_resH = GetSystemMetrics(SM_CYSCREEN); }
+    else if (sscanf(res, "%lux%lu", &g_resW, &g_resH) != 2) g_resW = g_resH = 0;
+    if (g_resW < 640 || g_resH < 480 || g_resW > 7680 || g_resH > 4320 || g_resW < g_resH) g_resW = g_resH = 0;
+    if (g_resW) {   /* resolution switch FUN_00449ec0: mov [0x7a1968], W / mov [0x7a1930], H; replace every mode from 1024 up */
+        int n = 0;
+        g_aspect = (float)g_resH / g_resW;
+        for (p = (BYTE *)0x449ec0; p < (BYTE *)0x44a160; p++)
+            if (p[0] == 0xC7 && p[1] == 0x05 && *(DWORD *)(p + 2) == 0x7a1968 && *(DWORD *)(p + 6) >= 1024 &&
+                p[10] == 0xC7 && p[11] == 0x05 && *(DWORD *)(p + 12) == 0x7a1930) {
+                poke((DWORD)(p + 6), 0, g_resW); poke((DWORD)(p + 16), 0, g_resH); n++;
+            }
+        logf_("screen: resolution %lux%lu (aspect %.4f), %d game modes replaced\n", g_resW, g_resH, g_aspect, n);
+    }
+    cam_set_fov(90);
+    ok &= poke(0x42c66d, 0x6fde08, (DWORD)&g_zoomMin) & poke(0x42c67e, 0x428c0000, fbits(70)) &
+          poke(0x42c68c, 0x6fde0c, (DWORD)&g_zoomMax) & poke(0x42c69d, 0x43020000, fbits(130));
+    ok &= poke(0x42aa31, 0x74c9b8, (DWORD)&g_fovRad) & poke(0x45bf9b, 0x74c9b8, (DWORD)&g_pickBase) &
+          poke(0x45c09c, 0x6fe640, (DWORD)&g_pickAspect);
+    /* 0x56eaa1: JZ +0x0b (74 0b) -> NOP NOP; 0x56eaa3: MOV EAX, [0x8bd4c0] -> MOV EAX, [&g_viewRadius] */
+    ok &= poke(0x56eaa4, 0x8bd4c0, (DWORD)&g_viewRadius) && poke2(0x56eaa1, 0x0b74, 0x9090);
+    for (i = 0; i < (int)(sizeof keySites / sizeof keySites[0]); i++) {
+        p = (BYTE *)keySites[i];
+        if (p[0] == 0xE8 && (DWORD)(p + 5) + *(DWORD *)(p + 1) == 0x40ca20) poke((DWORD)(p + 1), 0, (DWORD)h_KeyTest - (DWORD)(p + 5));
+        else { logf_("camera: unexpected key call at %08lx\n", (DWORD)p); ok = FALSE; }
+    }
+    g_camPatched = ok;
+    logf_("camera: zoom/FOV/picking/WASD patches %s\n", ok ? "applied" : "INCOMPLETE");
+}
+
+/* Every frame (game thread): follow the settings panel and keep the game on our FOV / aspect. */
+static void cam_frame(void)
+{
+    TpwShared *sh = g_sh;
+    float fov, zmin, zmax, cur;
+    void *frustum;
+    if (!g_camPatched) return;
+    {   /* draw area for the next frame: the original 460 covers zoom 130, 4:3, fov 90; scale up from there */
+        float z = *(volatile float *)0x7909ec, t = (float)tan(g_fovDeg * 0.5 * 3.14159265 / 180), r = 460;
+        if (z > 130) r *= z / 130;
+        if (g_aspect < 0.75f) r *= 0.75f / g_aspect;
+        if (t > 1) r *= t;
+        if (r > 2600) r = 2600;   /* ponytail: about the whole 128-tile map from anywhere on it */
+        g_viewRadius = (*(volatile DWORD *)0x8bcbc8 & 0x2000) ? *(volatile float *)0x8bd4c0 : r;
+    }
+    if (g_resW) {
+        volatile float *a = (volatile float *)0x8bcbcc;
+        if (*a != g_aspect && *a > 0) { logf_("screen: aspect %.4f -> %.4f\n", *a, g_aspect); *a = g_aspect; *(volatile float *)0x87b0d0 = 2 * g_aspect; }
+    }
+    if (!sh || !(sh->camFov > 0)) return;   /* renderer not up yet */
+    g_wasd = sh->camWasd != 0;
+    shortcuts_wasd(g_wasd);
+    zmin = sh->camZoomMin; zmax = sh->camZoomMax;
+    if (zmin >= 5 && zmax <= 1000 && zmin < zmax && (zmin != g_zoomMin || zmax != g_zoomMax)) {
+        g_zoomMin = zmin; g_zoomMax = zmax;
+        poke(0x42c67e, 0, fbits(zmin)); poke(0x42c69d, 0, fbits(zmax));
+        logf_("camera: zoom range %.0f..%.0f\n", zmin, zmax);
+    }
+    fov = sh->camFov;
+    if (fov >= 30 && fov <= 150 && fov != g_fovDeg) { g_fovDeg = fov; cam_set_fov(fov); logf_("camera: FOV %.0f\n", fov); }
+    /* the game sets 90 on park load (100 in the front-end menus: left alone) */
+    cur = *(volatile float *)0x87af58;
+    frustum = *(void **)0x879d54;
+    if (frustum && cur != g_fovDeg && (cur == 90 || cur == g_fovApplied)) {
+        ((PROJ_t)0x578be0)((void *)0x87b110, NULL, *(float *)0x87b1dc, *(float *)0x768acc, g_fovDeg);
+        ((FRUST_t)0x56b790)(frustum, NULL, g_fovDeg);
+        g_fovApplied = g_fovDeg;
+    }
+}
+
 typedef HRESULT (WINAPI *DICD_t)(void *, REFGUID, void **, IUnknown *);
 static DICD_t o_DICreateDevice;
 static HRESULT WINAPI h_DICreateDevice(void *di, REFGUID g, void **out, IUnknown *u)
@@ -1028,6 +1220,7 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r)
         /* Windowed (dxwrapper): without this, 150% display scaling blows the 2048x1536 window up past the screen height
          * and it gets squeezed to 16:9. Must happen before the game creates its window, hence DllMain. */
         if (!g_minimal) SetProcessDPIAware();
+        if (!g_minimal) cam_patch();
         patch_iat();
         fflush(g_log);
     } else if (reason == DLL_PROCESS_DETACH && g_log) {

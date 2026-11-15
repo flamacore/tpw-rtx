@@ -19,6 +19,8 @@ The game never knows.
 - ✨ **DLSS 5 neural rendering:** _optional, unofficial and experimental._ See [docs/DLSS5.md](docs/DLSS5.md).
 - 🎚️ **Live settings panel (Ctrl+Alt+S):** sun direction and height, exposure, colour, bounce light, bumps, highlights and DLSS. The game keeps running while you tune.
 - 🪨 **Pseudo-PBR:** surface bumps and glossy sun highlights derived from the original textures.
+- 🎥 **Camera upgrades:** zoom much further in and out, an FOV slider, WASD to pan and Q/E to rotate, and _experimental_ true
+  widescreen (the game renders a wider view instead of stretching).
 - 🛠️ **Fixes that help even without ray tracing:**
   - the park slowing to a crawl when Windows has been running for a few days;
   - the mouse freezing after alt-tab;
@@ -94,6 +96,8 @@ nvngx_dlssnr.dll                DLSS 5 model, you supply it (optional, unofficia
 
 | Keys | What it does |
 |---|---|
+| **W A S D** | Pan the camera (the arrow keys and numpad still work) |
+| **Q / E** | Rotate the camera |
 | **Ctrl+Alt+S** | Settings panel. The game keeps running; the mouse goes to the panel until you close it. |
 | **Ctrl+Alt+R** | Show/hide the ray-traced picture (compare with the original) |
 | **Ctrl+Alt+T** | Ray tracing on/off (off shows the original game) |
@@ -112,6 +116,15 @@ Settings save automatically to `tpwrtx_settings.json` in the game folder. **Defa
 | Own denoiser | passes, smoothing, temporal frames, TAA jitter (only used when DLSS Ray Reconstruction is off) |
 | DLSS | Ray Reconstruction: off / DLAA / Quality / Balanced / Performance |
 | DLSS 5 | on/off, detail strength, colour strength, highlight guard, style, model preset, intensity, local structure, local tone |
+| Camera | FOV (90 = original), closest zoom (70 = original), farthest zoom (130 = original), WASD pan + Q/E rotate on/off |
+
+**Camera notes:** the game tilts the camera with the zoom, so zooming in also lowers the view and zooming far out turns it almost
+top-down. While WASD is on, the game's own one-letter shortcuts **A** (all items) and **S** (all staff) are switched off; their
+toolbar buttons still work.
+
+**Widescreen (experimental):** add `resolution = auto` (your monitor's resolution) or a size such as `resolution = 2560x1440` to
+`tpwrtx.ini`. The game then renders at that size with a wider field of view, and mouse picking is adjusted to match. The game's
+interface was made for 4:3 and isn't laid out for other shapes, so expect some oddities there. Remove the line to go back.
 
 **Performance:** the renderer draws at the game window's height (`height = auto` in `tpwrtx.ini`). If it's too slow, choose
 DLSS **Quality** or **Performance** in the panel, or set a lower fixed `height`, such as `1080`.
@@ -136,7 +149,9 @@ DLSS **Quality** or **Performance** in the panel, or set a lower fixed `height`,
 - Some 3D UI pop-ups and very fast camera moves can show small glitches. Only the camera has motion vectors, so moving visitors can
   smear slightly under DLSS.
 - The game reconstructs only what it draws; things far off-screen are kept from earlier frames and can be out of date.
-- One `TP.EXE` build only, for the ray tracing (see Requirements).
+- One `TP.EXE` build only, for the ray tracing and the camera upgrades (see Requirements).
+- Widescreen is experimental: parts of the game's 4:3 interface may sit oddly.
+- Zoomed very far out, the game draws much more of the park, which costs CPU time in the 1999 engine.
 
 ## How it works
 

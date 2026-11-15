@@ -97,6 +97,25 @@ full speed. While it is open, the renderer sets a heartbeat in shared memory. Th
 so the system cursor can reach the panel, and takes them back when the panel closes. If the renderer dies, the heartbeat stops and
 the hook takes them back after 2 seconds.
 
+## Camera and widescreen
+
+The hook patches a few instructions in TP.EXE's memory at start-up (the file on disk is never changed), then follows the settings
+panel every frame:
+
+- **Zoom:** the camera distance is clamped to 70..130 by two compares and two immediates in the camera update. They now read the
+  panel's limits. The game derives the pitch from the zoom (45° at 70, 65° at 130), so beyond the old range the camera keeps
+  tilting, capped at about 84°.
+- **FOV:** the camera init passes a fixed 90 to the projection (`FUN_00578be0`) and frustum (`FUN_0056b790`) builders. The init now
+  reads the panel's value, and the hook calls both builders again when it changes. Mouse picking keeps its own copy of the
+  frustum (a half-diagonal angle and the 4:3 aspect), which is recomputed to match.
+- **Draw area:** the engine only draws objects and terrain inside a square around the camera, 460 units across, which was just
+  enough for zoom 130 at 4:3. That size now grows with the zoom, the FOV and the screen width.
+- **WASD / Q/E:** the camera code asks `FUN_0040ca20(group, action)` whether a bound key is down. Those calls go through a wrapper
+  that also checks W/A/S/D/Q/E, but only while the game's keyboard group is enabled (it is disabled while you type a name).
+- **Widescreen:** the resolution switch (mode 7 = 2048×1536) is patched to the configured size, the aspect (`0x8bcbcc`, 0.75)
+  follows it, and the window is kept at that shape instead of 4:3. The renderer reads the field of view and aspect from the game
+  every frame, so the reconstruction follows both.
+
 ## Game addresses (one TP.EXE build)
 
 | Address | Meaning |
@@ -107,6 +126,12 @@ the hook takes them back after 2 seconds.
 | `0xfaa540`, `0xfaa544` | pointer x, y (shorts, 2048×1536 space) |
 | `0x7a1a14` | state flags (bit 3 = app active) |
 | `0x8bd518` | main window handle |
+| `0x7909ec` | camera distance (zoom); clamp at `0x42c66b`..`0x42c6a1` |
+| `0x87af58` | current FOV (degrees; 90 in a park, 100 in the menus) |
+| `0x8bcbcc` | aspect (height / width) |
+| `0x56eaae` | draw-area size (460) |
+| `0x449ec0` | resolution switch |
+| `0x787c14`, `0x78721c` | camera and shortcut key groups |
 
 These were found with Ghidra in TP.EXE SHA-256 `d0399acf…27ac9`. The hook checks the build (PE timestamp and image size) and uses
 none of them on any other build.
