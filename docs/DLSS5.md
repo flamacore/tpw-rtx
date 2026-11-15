@@ -7,8 +7,6 @@
 
 ## What it does
 
-<p align="center"><img src="media/dlss5-before-after.gif" width="560" alt="DLSS 5 off and on, same frame"></p>
-
 DLSS 5 ("3D-guided neural rendering") is a generative pass. It looks at a finished frame plus depth and motion vectors and
 re-synthesises lighting and material detail. In tpw-rtx it runs on the final, colour-graded, ray-traced image, before water, smoke
 and the game's UI are drawn on top, so it never touches the interface. Its picture is then blended back with three settings:

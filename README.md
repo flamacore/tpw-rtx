@@ -29,11 +29,11 @@ The game never knows.
 |:---:|:---:|
 | <img src="docs/media/live-tuning.webp" width="400" alt="Adjusting sun and lighting live"> | <img src="docs/media/park.jpg" width="400" alt="Ray-traced park"> |
 
-### Before & after: DLSS 5
+### Before & after
 
 <p align="center">
-  <img src="docs/media/dlss5-before-after.gif" width="640" alt="The same path-traced frame with DLSS 5 neural rendering off and on">
-  <br><sub>The same moment in the same park, path-traced both times: DLSS 5 neural rendering <b>off</b> versus <b>on</b>. DLSS 5 is optional and unofficial; see <a href="docs/DLSS5.md">docs/DLSS5.md</a>.</sub>
+  <img src="docs/media/before-after.gif" width="720" alt="The original 1999 graphics next to the same spot path-traced with DLSS 5">
+  <br><sub>The same spot in the same park: the original 1999 renderer versus tpw-rtx's path tracing with DLSS Ray Reconstruction and DLSS 5 (optional and unofficial, see <a href="docs/DLSS5.md">docs/DLSS5.md</a>). Taken a few in-game months apart, so the visitors differ.</sub>
 </p>
 
 ---
