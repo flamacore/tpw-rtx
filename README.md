@@ -32,8 +32,8 @@ The game never knows.
 ### Before & after
 
 <p align="center">
-  <img src="docs/media/before-after.gif" width="720" alt="The original 1999 graphics next to the same spot path-traced with DLSS 5">
-  <br><sub>The same spot in the same park: the original 1999 renderer versus tpw-rtx's path tracing with DLSS Ray Reconstruction and DLSS 5 (optional and unofficial, see <a href="docs/DLSS5.md">docs/DLSS5.md</a>). Taken a few in-game months apart, so the visitors differ.</sub>
+  <img src="docs/media/before-after.gif" width="720" alt="The original 1999 graphics and the same view path-traced with DLSS 5">
+  <br><sub>Same park, same camera: the original 1999 renderer versus tpw-rtx's path tracing with DLSS Ray Reconstruction and DLSS 5 (optional and unofficial, see <a href="docs/DLSS5.md">docs/DLSS5.md</a>).</sub>
 </p>
 
 ---
