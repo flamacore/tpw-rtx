@@ -1,0 +1,5 @@
+* text=auto
+*.bat text eol=crlf
+*.ini text eol=crlf
+*.webp binary
+*.jpg binary
