@@ -18,6 +18,10 @@ and the game's UI are drawn on top, so it never touches the interface. Its pictu
 **Style** (Default / Natural / Cinematic), **model preset**, **intensity**, **local structure** and **local tone** are the model's
 own parameters. Changing one rebuilds the model, with a short pause.
 
+**Resolution** (50–100%, default 67%) sets the size the model works at. Its cost grows with the number of pixels: about 17 ms at
+3640×2048 on an RTX 4080 SUPER, and about 8.6 ms at 67%. The model's picture is scaled back up and blended over the full-resolution
+frame, so the game's own colours and fine detail stay sharp. Changing it also rebuilds the model.
+
 ## What you need
 
 - **An NVIDIA RTX 50 series GPU.** That is what NVIDIA officially supports for DLSS 5. Reports of it running on older cards rely on

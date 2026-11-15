@@ -28,8 +28,7 @@ cbuffer C : register(b0)
 };
 
 RaytracingAccelerationStructure scene : register(t0);
-StructuredBuffer<Vtx>   verts   : register(t1);
-StructuredBuffer<uint>  indices : register(t2);   // opaque triangles first, then alpha-tested
+StructuredBuffer<Vtx>   verts   : register(t1);   // 3 per triangle (no index buffer), opaque triangles first, then alpha-tested
 StructuredBuffer<uint2> mats    : register(t3);   // per triangle: x = texId | alphaTest << 16, y = alphaRef
 StructuredBuffer<Light> lights  : register(t4);
 Texture2D gTex[] : register(t0, space1);
@@ -92,7 +91,7 @@ bool alphaPass(uint tri, float2 bary)
 {
     uint2 m = mats[tri];
     if (!(m.x & 0x10000)) return true;
-    Vtx a = verts[indices[tri * 3]], b = verts[indices[tri * 3 + 1]], c = verts[indices[tri * 3 + 2]];
+    Vtx a = verts[tri * 3], b = verts[tri * 3 + 1], c = verts[tri * 3 + 2];
     float2 uv = a.uv * (1 - bary.x - bary.y) + b.uv * bary.x + c.uv * bary.y;
     float alpha = gTex[NonUniformResourceIndex(m.x & 0xffff)].SampleLevel(samp, uv, 0).a;
     return alpha * 255.0 >= max(m.y, 1u);
@@ -122,7 +121,7 @@ struct Surf { float3 p, n, gn, albedo; float rough; };
 
 Surf surface(Hit h, float3 o, float3 d, float coneWidth, bool detail)
 {
-    Vtx a = verts[indices[h.tri * 3]], b = verts[indices[h.tri * 3 + 1]], c = verts[indices[h.tri * 3 + 2]];
+    Vtx a = verts[h.tri * 3], b = verts[h.tri * 3 + 1], c = verts[h.tri * 3 + 2];
     float w = 1 - h.bary.x - h.bary.y;
     Surf s;
     s.p = o + d * h.t;

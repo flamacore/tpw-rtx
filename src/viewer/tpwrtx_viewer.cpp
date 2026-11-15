@@ -10,6 +10,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <commctrl.h>
+#include <timeapi.h>
 #include <algorithm>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -22,6 +23,8 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <execution>
+#include <numeric>
 #include "../shared/tpwrtx_shared.h"
 #include "nvsdk_ngx_helpers_dlssd_d3d.h"   // NVIDIA DLSS SDK (include dir + nvsdk_ngx_s.lib on the build line)
 #pragma comment(lib, "d3d12.lib")
@@ -29,6 +32,7 @@
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "winmm.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 using Microsoft::WRL::ComPtr;
 
@@ -45,13 +49,13 @@ static UINT64 align(UINT64 v, UINT64 a) { return (v + a - 1) & ~(a - 1); }
 static const UINT64 OFF_VB = 0;                                                     // raster vertices (frame)
 static const UINT64 OFF_IB = align(OFF_VB + TPWRTX_MAX_VERTS * 24ull, 65536);       // raster indices
 static const UINT64 OFF_RTV = align(OFF_IB + TPWRTX_MAX_INDICES * 4ull, 65536);     // RT triangle soup vertices
-static const UINT64 OFF_RTI = align(OFF_RTV + RT_MAX_TRIS * 3ull * 24, 65536);      // RT indices
-static const UINT64 OFF_MAT = align(OFF_RTI + RT_MAX_TRIS * 3ull * 4, 65536);       // RT per-triangle materials
+static const UINT64 OFF_MAT = align(OFF_RTV + RT_MAX_TRIS * 3ull * 24, 65536);      // RT per-triangle materials (non-indexed soup)
 static const UINT64 OFF_LIGHT = align(OFF_MAT + RT_MAX_TRIS * 8ull, 65536);
 static const UINT64 OFF_INST = align(OFF_LIGHT + MAX_LIGHTS * 32ull, 65536);
 static const UINT64 OFF_CB = align(OFF_INST + 64, 65536);                           // raster CB (256) + RT CB (512)
 static const UINT64 OFF_STAGE = align(OFF_CB + 1024, 65536);                        // texture staging
-static const UINT64 STAGE_BYTES = 48ull << 20, UPLOAD_BYTES = OFF_STAGE + STAGE_BYTES;
+static const UINT64 STAGE_BYTES = 48ull << 20, UPLOAD_BYTES = OFF_STAGE + STAGE_BYTES;   // per frame slot
+static const UINT64 SOUP_MAT = align(RT_MAX_TRIS * 3ull * 24, 65536), SOUP_BYTES = SOUP_MAT + RT_MAX_TRIS * 8ull;   // soupGpu layout
 
 // ---------------------------------------------------------------- math (row-vector, D3D style)
 struct M4 { float m[4][4]; };
@@ -155,6 +159,7 @@ static Setting g_set[] = {
     {"nrIntensity", "DLSS 5 intensity", 1.0f, 0.0f, 2.0f},
     {"nrStructure", "DLSS 5 local structure", 1.0f, 0.0f, 2.0f},
     {"nrTone", "DLSS 5 local tone", 1.0f, 0.0f, 2.0f},
+    {"nrScale", "DLSS 5 resolution (%)", 67, 50, 100, true},   // the model's cost grows with its pixel count (17 ms at 3640x2048)
     // Game camera (applied by the hook inside TP.EXE). The game's pitch follows the zoom: closer = lower, farther = top-down.
     {"fov", "Camera FOV (90 = original)", 90, 50, 130, true},
     {"zoomMin", "Closest zoom (70 = original)", 40, 15, 70, true},
@@ -165,7 +170,7 @@ static const char *const kNrStyleNames[] = {"Default", "Natural", "Cinematic"};
 static const char *const kDlssNames[] = {"off (own denoiser)", "DLAA (native)", "Quality", "Balanced", "Performance"};
 enum { ST_EXPOSURE, ST_CONTRAST, ST_SATURATION, ST_SUN, ST_SUNAZ, ST_SUNEL, ST_SUNSOFT, ST_SKY, ST_BOUNCE, ST_TORCH, ST_TINT, ST_SHADE,
        ST_NORMAL, ST_SPEC, ST_GLOSS, ST_DENOISE, ST_DNSMOOTH, ST_HISTORY, ST_JITTER, ST_DLSS,
-       ST_NR, ST_NRSTRENGTH, ST_NRCOLOUR, ST_NRGUARD, ST_NRSTYLE, ST_NRPRESET, ST_NRINTENSITY, ST_NRSTRUCTURE, ST_NRTONE,
+       ST_NR, ST_NRSTRENGTH, ST_NRCOLOUR, ST_NRGUARD, ST_NRSTYLE, ST_NRPRESET, ST_NRINTENSITY, ST_NRSTRUCTURE, ST_NRTONE, ST_NRSCALE,
        ST_FOV, ST_ZOOMMIN, ST_ZOOMMAX, ST_WASD, ST_COUNT };
 static_assert(ST_COUNT == sizeof g_set / sizeof g_set[0], "settings table and enum out of sync");
 static float S(int i) { return g_set[i].v; }
@@ -539,7 +544,27 @@ static ComPtr<ID3D12CommandQueue> queue;
 static ComPtr<IDXGISwapChain3> swap;
 static ComPtr<ID3D12DescriptorHeap> rtvHeap, dsvHeap, srvHeap;
 static ComPtr<ID3D12Resource> backbuf[BUFS], depth, upload, readback, whiteTex;
-static ComPtr<ID3D12CommandAllocator> alloc;
+static ComPtr<ID3D12CommandAllocator> alloc;   // the current frame's (allocs[fi]); upload / upPtr likewise
+// Two frames in flight: the CPU builds frame N+1 while the GPU renders frame N. Everything the CPU writes for the GPU
+// (upload buffer, command allocator, dynamic descriptors) exists once per slot; anything the GPU might still be using is
+// only released or recreated after gpu_flush(), or parked in graveyard[] until its slot comes round again.
+static const UINT FRAMES = 2;
+static ComPtr<ID3D12Resource> uploads[FRAMES];
+static uint8_t *upPtrs[FRAMES];
+static ComPtr<ID3D12CommandAllocator> allocs[FRAMES];
+static UINT64 frameFence[FRAMES];
+static UINT fi;
+static std::vector<ComPtr<ID3D12Resource>> graveyard[FRAMES];
+// RT triangles (3 x GpuVertex each) and their materials in video memory: rays fetch them on every hit and alpha test,
+// which from the upload heap meant millions of random reads over PCIe per frame.
+static ComPtr<ID3D12Resource> soupGpu;
+static D3D12_RESOURCE_STATES soupState = D3D12_RESOURCE_STATE_COPY_DEST;
+// GPU timing per frame slot (logged every few seconds): start, accel, RT, DLSS RR, composite, DLSS 5, end
+enum { TS_START, TS_ACCEL, TS_RT, TS_RR, TS_COMP, TS_NR, TS_END, TS_N };
+static ComPtr<ID3D12QueryHeap> tsHeap;
+static ComPtr<ID3D12Resource> tsReadback;
+static UINT64 tsFreq;
+static uint32_t tsMask[FRAMES];
 static ComPtr<ID3D12GraphicsCommandList4> cl;
 static ComPtr<ID3D12Fence> fence;
 static ComPtr<ID3D12RootSignature> rootSig, rtRootSig, compRootSig, atrousRootSig;
@@ -558,8 +583,9 @@ static uint32_t texGen = ~0u;
 static bool rtAvailable;
 static const UINT HEAP_RT = TPWRTX_MAX_TEX + 1;   // descriptor heap: [0] white, [1..MAX_TEX] game textures, then RT views
 static const UINT RT_UAVS = 10;                               // RT UAV table per ping-pong side (u0..u9)
-static const UINT HEAP_DYN = HEAP_RT + 2 * RT_UAVS, HEAP_DYN_N = 48;   // per-frame tables (denoise, composite); safe: one frame in flight
+static const UINT HEAP_DYN = HEAP_RT + 2 * RT_UAVS, HEAP_DYN_N = 48;   // per-frame tables (denoise, composite), one block per frame slot
 static UINT dynUsed;
+static UINT dyn_alloc(UINT n) { UINT t = HEAP_DYN + fi * HEAP_DYN_N + dynUsed; dynUsed += n; return t; }
 
 static D3D12_CPU_DESCRIPTOR_HANDLE cpu_desc(UINT i) { D3D12_CPU_DESCRIPTOR_HANDLE h = srvHeap->GetCPUDescriptorHandleForHeapStart(); h.ptr += (SIZE_T)i * srvInc; return h; }
 static D3D12_GPU_DESCRIPTOR_HANDLE gpu_desc(UINT i) { D3D12_GPU_DESCRIPTOR_HANDLE h = srvHeap->GetGPUDescriptorHandleForHeapStart(); h.ptr += (UINT64)i * srvInc; return h; }
@@ -649,6 +675,53 @@ static ID3D12PipelineState *pso_for(const TpwDraw &d, bool ui)
     CHECK(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&p)));
     psos[key] = p;
     return p.Get();
+}
+
+static void gpu_flush()   // wait for everything submitted so far, before releasing or recreating what it may use
+{
+    if (fence->GetCompletedValue() < fenceVal) { fence->SetEventOnCompletion(fenceVal, fenceEvt); WaitForSingleObject(fenceEvt, INFINITE); }
+}
+
+static void ts(UINT k) { cl->EndQuery(tsHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, fi * TS_N + k); tsMask[fi] |= 1u << k; }
+
+// Per-frame timings, averaged and logged every 5 s to tpwrtx_viewer.log
+static double perfGpu[TS_N], perfCpu;
+static uint32_t perfGpuN, perfFrames, perfRtTris;
+static bool tsUsed[FRAMES];
+static void perf_collect(UINT slot)   // the slot's previous frame has finished: read its timestamps
+{
+    if (!tsUsed[slot]) return;
+    tsUsed[slot] = false;
+    uint8_t *m; D3D12_RANGE r{slot * TS_N * 8, (slot + 1) * TS_N * 8};
+    if (FAILED(tsReadback->Map(0, &r, (void **)&m))) return;
+    const UINT64 *q = (const UINT64 *)m + slot * TS_N;
+    if (q[TS_END] > q[TS_START] && tsFreq) {
+        double ms = 1000.0 / (double)tsFreq;
+        perfGpu[0] += (q[TS_END] - q[TS_START]) * ms;
+        for (int k = 1; k < TS_N; k++) perfGpu[k] += (q[k] >= q[k - 1] ? q[k] - q[k - 1] : 0) * ms;
+        perfGpuN++;
+    }
+    D3D12_RANGE none{0, 0}; tsReadback->Unmap(0, &none);
+}
+static void perf_log(uint32_t gameFrames, double secs)
+{
+    double g = perfGpuN ? 1.0 / perfGpuN : 0, c = perfFrames ? 1.0 / perfFrames : 0;
+    fprintf(g_log, "perf: %.0f fps (game %.0f) | CPU %.1f ms | GPU %.1f ms = uploads+accel %.1f, rays %.1f, DLSS RR %.1f, composite %.1f, DLSS 5 %.1f, rest %.1f | %u RT tris\n",
+            perfFrames / secs, gameFrames / secs, perfCpu * c, perfGpu[0] * g, perfGpu[TS_ACCEL] * g, perfGpu[TS_RT] * g, perfGpu[TS_RR] * g,
+            perfGpu[TS_COMP] * g, perfGpu[TS_NR] * g, perfGpu[TS_END] * g, perfRtTris);
+    fflush(g_log);
+    memset(perfGpu, 0, sizeof perfGpu); perfCpu = 0; perfGpuN = perfFrames = 0;
+}
+
+// Split [0, n) into chunks over the CPU's cores (Windows thread pool via the C++17 parallel algorithms).
+static const size_t PAR_CHUNK = 16384;
+template <class F> static void par_for(size_t n, F fn)   // fn(begin, end, chunkIndex)
+{
+    size_t nc = (n + PAR_CHUNK - 1) / PAR_CHUNK;
+    if (nc <= 1) { if (n) fn((size_t)0, n, (size_t)0); return; }
+    static std::vector<size_t> ids;
+    if (ids.size() < nc) { ids.resize(nc); std::iota(ids.begin(), ids.end(), (size_t)0); }
+    std::for_each(std::execution::par, ids.begin(), ids.begin() + nc, [&](size_t c) { fn(c * PAR_CHUNK, std::min(n, (c + 1) * PAR_CHUNK), c); });
 }
 
 static void submit_and_wait()
@@ -752,6 +825,7 @@ static void init_rt()
         make_uav(rrSpecAlb.Get(), b + 7, DXGI_FORMAT_R8G8B8A8_UNORM);   make_uav(rrNormRough.Get(), b + 8, DXGI_FORMAT_R16G16B16A16_FLOAT);
         make_uav(rrMotion.Get(), b + 9, DXGI_FORMAT_R16G16_FLOAT);
     }
+    soupGpu = buffer(SOUP_BYTES, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
     nr_gpu_init();
     rtAvailable = true;
 }
@@ -786,7 +860,7 @@ static bool rr_update(int mode)
 {
     if (!rrAvail) mode = 0;
     if (mode == rrModeCur) return rrHandle != nullptr;
-    if (rrHandle) { NVSDK_NGX_D3D12_ReleaseFeature(rrHandle); rrHandle = nullptr; }   // GPU is idle: one frame in flight
+    if (rrHandle) { gpu_flush(); NVSDK_NGX_D3D12_ReleaseFeature(rrHandle); rrHandle = nullptr; }   // earlier frames may still use it
     rrModeCur = mode; rrW = WIN_W; rrH = WIN_H;
     if (!mode) return false;
     static const NVSDK_NGX_PerfQuality_Value pq[] = {NVSDK_NGX_PerfQuality_Value_DLAA, NVSDK_NGX_PerfQuality_Value_DLAA,
@@ -828,28 +902,35 @@ static struct {
     bool tried, ok;
     PFN_FwdCreate create; PFN_FwdEval eval; PFN_FwdRelease release;
     void *feature;
-    float built[5];   // style, preset, intensity, structure, tone the feature was created with
+    float built[6];   // style, preset, intensity, structure, tone, resolution the feature was created with
+    UINT w, h;        // the model's working size (DLSS 5 resolution setting)
     bool fresh;       // first evaluate after creation: reset the model's history
 } nr;
 static ComPtr<ID3D12Resource> nrIn, nrOut;
 static ComPtr<ID3D12RootSignature> nrBlendRoot;
-static ComPtr<ID3D12PipelineState> nrBlendPso;
+static ComPtr<ID3D12PipelineState> nrBlendPso, nrBlitPso;
+static ComPtr<ID3D12Resource> nrSmall;   // the frame scaled to the model's working size (top-left nr.w x nr.h)
+static const UINT RTV_NRSMALL = BUFS;    // its slot in rtvHeap
 
 static const char *kNrBlend = R"(
 Texture2D<float4> orig : register(t0);   // the frame as we composed it (display-referred)
-Texture2D<float4> model : register(t1);  // the model's picture of it
-cbuffer K : register(b0) { float strength, colour, guard, pad; };
+Texture2D<float4> model : register(t1);  // the model's picture of it (top-left part, scaled by modelScale)
+SamplerState lin : register(s0);
+cbuffer K : register(b0) { float strength, colour, guard, pad; float2 modelScale, invSize; };
 float lum(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 float4 VSFull(uint id : SV_VertexID) : SV_Position { float2 uv = float2((id << 1) & 2, id & 2); return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); }
 float4 PSBlend(float4 pos : SV_Position) : SV_Target {
     int3 p = int3(pos.xy, 0);
-    float3 o = pow(saturate(orig.Load(p).rgb), 2.2), m = pow(saturate(model.Load(p).rgb), 2.2);   // in linear light
+    float3 o = pow(saturate(orig.Load(p).rgb), 2.2);   // in linear light
+    float2 uv = min(pos.xy * invSize * modelScale, modelScale - 0.5 * invSize);   // stay inside the part the model wrote
+    float3 m = pow(saturate(model.SampleLevel(lin, uv, 0).rgb), 2.2);
     float r = min(lum(m) / max(lum(o), 1e-4), guard);   // brightness ratio, capped: no blown-out highlights
     float3 lumOnly = o * r;                             // the model's light with our colour
     float3 capped = m * min(1, guard * max(lum(o), 1e-4) / max(lum(m), 1e-4));
     float3 target = lerp(lumOnly, capped, colour);
     return float4(pow(saturate(lerp(o, target, strength)), 1 / 2.2), 1);
 }
+float4 PSBlit(float4 pos : SV_Position) : SV_Target { return orig.SampleLevel(lin, pos.xy * invSize, 0); }   // invSize = 1 / target size here
 )";
 
 static void nr_gpu_init()
@@ -859,8 +940,13 @@ static void nr_gpu_init()
     D3D12_DESCRIPTOR_RANGE srvRange{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0};
     D3D12_ROOT_PARAMETER rp[2]{};
     rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; rp[0].DescriptorTable = {1, &srvRange};
-    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[1].Constants = {0, 0, 4};
-    nrBlendRoot = make_root({2, rp, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE});
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[1].Constants = {0, 0, 8};
+    D3D12_STATIC_SAMPLER_DESC lin{D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                                  0, 1, D3D12_COMPARISON_FUNC_NEVER, D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE, 0, 0, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL};
+    nrBlendRoot = make_root({2, rp, 1, &lin, D3D12_ROOT_SIGNATURE_FLAG_NONE});
+    nrSmall = texture2d(WIN_W, WIN_H, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    { D3D12_CPU_DESCRIPTOR_HANDLE h = rtvHeap->GetCPUDescriptorHandleForHeapStart(); h.ptr += RTV_NRSMALL * rtvInc; dev->CreateRenderTargetView(nrSmall.Get(), nullptr, h); }
     auto vs = compile(kNrBlend, "VSFull", "vs_5_1"), ps = compile(kNrBlend, "PSBlend", "ps_5_1");
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = nrBlendRoot.Get();
@@ -872,6 +958,10 @@ static void nr_gpu_init()
     pd.SampleMask = UINT_MAX; pd.NumRenderTargets = 1; pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM; pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     pd.SampleDesc.Count = 1;
     CHECK(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&nrBlendPso)));
+    auto bps = compile(kNrBlend, "PSBlit", "ps_5_1");
+    pd.PS = {bps->GetBufferPointer(), bps->GetBufferSize()};
+    pd.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    CHECK(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&nrBlitPso)));
 }
 
 // Load the forwarder + model and initialise it, once. False (and a log line) if anything is missing or refuses.
@@ -906,8 +996,8 @@ static void nr_params(bool atCreate)
 {
     NVSDK_NGX_Parameter *P = ngxCaps;
     NVSDK_NGX_Parameter_SetI(P, "DLSSNR.Enabled", 1);
-    NVSDK_NGX_Parameter_SetI(P, "DLSSNR.Width", (int)WIN_W);
-    NVSDK_NGX_Parameter_SetI(P, "DLSSNR.Height", (int)WIN_H);
+    NVSDK_NGX_Parameter_SetI(P, "DLSSNR.Width", (int)nr.w);
+    NVSDK_NGX_Parameter_SetI(P, "DLSSNR.Height", (int)nr.h);
     if (atCreate) {
         NVSDK_NGX_Parameter_SetI(P, "CreationNodeMask", 1);
         NVSDK_NGX_Parameter_SetI(P, "VisibilityNodeMask", 1);
@@ -927,11 +1017,12 @@ static void nr_params(bool atCreate)
 // ready: creating and evaluating in the same command list is what hung GPUs in the community integration.
 static bool nr_ready()
 {
-    float want[5] = {S(ST_NRSTYLE), S(ST_NRPRESET), S(ST_NRINTENSITY), S(ST_NRSTRUCTURE), S(ST_NRTONE)};
+    float want[6] = {S(ST_NRSTYLE), S(ST_NRPRESET), S(ST_NRINTENSITY), S(ST_NRSTRUCTURE), S(ST_NRTONE), S(ST_NRSCALE)};
     if (nr.feature && !memcmp(want, nr.built, sizeof want)) return true;
-    if (nr.feature) { nr.release(nr.feature); nr.feature = nullptr; }   // GPU is idle: one frame in flight
+    if (nr.feature) { gpu_flush(); nr.release(nr.feature); nr.feature = nullptr; }   // earlier frames may still use it
     static int fails;
     if (fails >= 3) return false;
+    nr.w = std::max(64u, (UINT)(WIN_W * want[5] / 100) & ~7u); nr.h = std::max(64u, (UINT)(WIN_H * want[5] / 100) & ~7u);
     nr_params(true);
     int r = nr.create(cl.Get(), 18, ngxCaps, &nr.feature);
     if (r != 1 || !nr.feature) {
@@ -939,7 +1030,7 @@ static bool nr_ready()
         fprintf(g_log, "DLSS 5: create FAILED (%08x)%s\n", (unsigned)r, fails >= 3 ? ", giving up for this session" : "");
     } else {
         memcpy(nr.built, want, sizeof want); nr.fresh = true;
-        fprintf(g_log, "DLSS 5: model created at %ux%u (style %s, preset %d, intensity %.2f)\n", WIN_W, WIN_H,
+        fprintf(g_log, "DLSS 5: model created at %ux%u (style %s, preset %d, intensity %.2f)\n", nr.w, nr.h,
                 kNrStyleNames[std::clamp((int)want[0], 0, 2)], (int)want[1], want[2]);
     }
     fflush(g_log);
@@ -948,23 +1039,42 @@ static bool nr_ready()
 
 // The pass: backbuffer (composited frame) -> model -> blended back into the backbuffer. Leaves the backbuffer as the
 // render target again. depth/motion are the RT guides at render size (rw x rh).
-static void nr_pass(ID3D12Resource *backbuf, UINT rw, UINT rh, bool reset)
+static void nr_pass(ID3D12Resource *backbuf, D3D12_CPU_DESCRIPTOR_HANDLE rtv, D3D12_CPU_DESCRIPTOR_HANDLE dsv, UINT rw, UINT rh, bool reset)
 {
     const auto SR = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     const auto UA = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     transition(backbuf, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
     cl->CopyResource(nrIn.Get(), backbuf);
     transition(nrIn.Get(), D3D12_RESOURCE_STATE_COPY_DEST, SR);
+    {   // scale the frame down to the model's working size (bilinear; 2x2 box at 50%)
+        UINT tbl = dyn_alloc(2);
+        make_srv(nrIn.Get(), tbl, DXGI_FORMAT_R8G8B8A8_UNORM); make_srv(nrIn.Get(), tbl + 1, DXGI_FORMAT_R8G8B8A8_UNORM);
+        transition(nrSmall.Get(), SR, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        D3D12_CPU_DESCRIPTOR_HANDLE sr = rtvHeap->GetCPUDescriptorHandleForHeapStart(); sr.ptr += RTV_NRSMALL * rtvInc;
+        cl->OMSetRenderTargets(1, &sr, FALSE, nullptr);
+        D3D12_VIEWPORT v{0, 0, (float)nr.w, (float)nr.h, 0, 1}; D3D12_RECT r{0, 0, (LONG)nr.w, (LONG)nr.h};
+        cl->RSSetViewports(1, &v); cl->RSSetScissorRects(1, &r);
+        ID3D12DescriptorHeap *heaps[] = {srvHeap.Get()};
+        cl->SetDescriptorHeaps(1, heaps);
+        cl->SetGraphicsRootSignature(nrBlendRoot.Get());
+        cl->SetPipelineState(nrBlitPso.Get());
+        cl->SetGraphicsRootDescriptorTable(0, gpu_desc(tbl));
+        float kb[8] = {0, 0, 0, 0, 1, 1, 1.0f / nr.w, 1.0f / nr.h};
+        cl->SetGraphicsRoot32BitConstants(1, 8, kb, 0);
+        cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        cl->DrawInstanced(3, 1, 0, 0);
+        transition(nrSmall.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, SR);
+    }
     transition(rtDepthTex.Get(), UA, SR); transition(rrMotion.Get(), UA, SR);
     NVSDK_NGX_Parameter *P = ngxCaps;
     nr_params(false);
-    NVSDK_NGX_Parameter_SetVoidPointer(P, "DLSSNR.Color", nrIn.Get());
+    NVSDK_NGX_Parameter_SetVoidPointer(P, "DLSSNR.Color", nrSmall.Get());
     NVSDK_NGX_Parameter_SetVoidPointer(P, "DLSSNR.Depth", rtDepthTex.Get());
     NVSDK_NGX_Parameter_SetVoidPointer(P, "DLSSNR.MVec", rrMotion.Get());
     NVSDK_NGX_Parameter_SetVoidPointer(P, "DLSSNR.Output", nrOut.Get());
     NVSDK_NGX_Parameter_SetI(P, "DLSSNR.DepthInverted", 0);
     NVSDK_NGX_Parameter_SetI(P, "DLSSNR.Reset", (reset || nr.fresh) ? 1 : 0);
-    struct { const char *k; UINT w, h; } sub[] = {{"Color", WIN_W, WIN_H}, {"Output", WIN_W, WIN_H}, {"Depth", rw, rh}, {"MVec", rw, rh}};
+    struct { const char *k; UINT w, h; } sub[] = {{"Color", nr.w, nr.h}, {"Output", nr.w, nr.h}, {"Depth", rw, rh}, {"MVec", rw, rh}};
     char name[64];
     for (auto &s : sub) {
         snprintf(name, sizeof name, "DLSSNR.%sSubrectBaseX", s.k); NVSDK_NGX_Parameter_SetI(P, name, 0);
@@ -982,16 +1092,19 @@ static void nr_pass(ID3D12Resource *backbuf, UINT rw, UINT rh, bool reset)
     uav_barrier(nrOut.Get());
     transition(nrOut.Get(), UA, SR);
     transition(backbuf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    // blend the model's picture back (NGX may have changed heaps/root state: set everything again)
-    UINT tbl = HEAP_DYN + dynUsed; dynUsed += 2;
+    // blend the model's picture back at full size (NGX may have changed heaps/root state: set everything again)
+    cl->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+    { D3D12_VIEWPORT v{0, 0, (float)WIN_W, (float)WIN_H, 0, 1}; D3D12_RECT r{0, 0, (LONG)WIN_W, (LONG)WIN_H}; cl->RSSetViewports(1, &v); cl->RSSetScissorRects(1, &r); }
+    UINT tbl = dyn_alloc(2);
     make_srv(nrIn.Get(), tbl, DXGI_FORMAT_R8G8B8A8_UNORM); make_srv(nrOut.Get(), tbl + 1, DXGI_FORMAT_R8G8B8A8_UNORM);
     ID3D12DescriptorHeap *heaps[] = {srvHeap.Get()};
     cl->SetDescriptorHeaps(1, heaps);
     cl->SetGraphicsRootSignature(nrBlendRoot.Get());
     cl->SetPipelineState(nrBlendPso.Get());
     cl->SetGraphicsRootDescriptorTable(0, gpu_desc(tbl));
-    float kc[4] = {r == 1 ? S(ST_NRSTRENGTH) : 0.0f, S(ST_NRCOLOUR), S(ST_NRGUARD), 0};
-    cl->SetGraphicsRoot32BitConstants(1, 4, kc, 0);
+    float kc[8] = {r == 1 ? S(ST_NRSTRENGTH) : 0.0f, S(ST_NRCOLOUR), S(ST_NRGUARD), 0,
+                   (float)nr.w / WIN_W, (float)nr.h / WIN_H, 1.0f / WIN_W, 1.0f / WIN_H};
+    cl->SetGraphicsRoot32BitConstants(1, 8, kc, 0);
     cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cl->DrawInstanced(3, 1, 0, 0);
     transition(nrOut.Get(), SR, UA);
@@ -1013,7 +1126,7 @@ static void init_d3d(HWND hwnd)
     ComPtr<IDXGISwapChain1> sc1;
     CHECK(fac->CreateSwapChainForHwnd(queue.Get(), hwnd, &sd, nullptr, nullptr, &sc1));
     CHECK(sc1.As(&swap));
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, BUFS};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, BUFS + 1};   // + nrSmall
     CHECK(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)));
     rtvInc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     for (UINT i = 0; i < BUFS; i++) {
@@ -1028,7 +1141,7 @@ static void init_d3d(HWND hwnd)
     D3D12_CLEAR_VALUE cv{DXGI_FORMAT_D32_FLOAT}; cv.DepthStencil.Depth = 1;
     CHECK(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv, IID_PPV_ARGS(&depth)));
     dev->CreateDepthStencilView(depth.Get(), nullptr, dsvHeap->GetCPUDescriptorHandleForHeapStart());
-    hd = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, HEAP_DYN + HEAP_DYN_N, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+    hd = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, HEAP_DYN + FRAMES * HEAP_DYN_N, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
     CHECK(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap)));
     srvInc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
@@ -1047,12 +1160,19 @@ static void init_d3d(HWND hwnd)
     rootSig = make_root({3, rp, 2, ss, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT});
     vsCode = compile(kShader, "VSMain", "vs_5_1"); psCode = compile(kShader, "PSMain", "ps_5_1");
 
-    CHECK(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc)));
+    for (UINT i = 0; i < FRAMES; i++) {
+        CHECK(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocs[i])));
+        uploads[i] = buffer(UPLOAD_BYTES, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        CHECK(uploads[i]->Map(0, nullptr, (void **)&upPtrs[i]));
+    }
+    alloc = allocs[0]; upload = uploads[0]; upPtr = upPtrs[0];
     CHECK(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&cl)));
     CHECK(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
     fenceEvt = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-    upload = buffer(UPLOAD_BYTES, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-    CHECK(upload->Map(0, nullptr, (void **)&upPtr));
+    D3D12_QUERY_HEAP_DESC qhd{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, FRAMES * TS_N};
+    CHECK(dev->CreateQueryHeap(&qhd, IID_PPV_ARGS(&tsHeap)));
+    tsReadback = buffer(FRAMES * TS_N * 8ull, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    queue->GetTimestampFrequency(&tsFreq);
     readback = buffer((UINT64)WIN_W * WIN_H * 4, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
 
     // 1x1 white texture for untextured draws (descriptor slot 0)
@@ -1090,7 +1210,7 @@ static UINT64 upload_texture(const TpwShared *sh, uint32_t id, UINT64 stageUsed)
     UINT64 base = align(OFF_STAGE + stageUsed, 512);
     dev->GetCopyableFootprints(&rd, 0, mips, base, fp, rows, rowBytes, &total);
     if (base - OFF_STAGE + total > STAGE_BYTES) return stageUsed;   // staging full: rest next frame
-    if (fresh) { tc.res = texture2d(w, h, mips); tc.w = w; tc.h = h; tc.srv = false; }
+    if (fresh) { if (tc.res) graveyard[fi].push_back(tc.res); tc.res = texture2d(w, h, mips); tc.w = w; tc.h = h; tc.srv = false; }
     else transition(tc.res.Get(), TEX_READ, D3D12_RESOURCE_STATE_COPY_DEST);
     // level 0 from shared memory, then 2x2 box filter downwards (straight in the staging buffer)
     const uint8_t *src = sh->texHeap + st.offset;
@@ -1154,11 +1274,12 @@ static void update_cache(std::vector<CTri> &current, const M4 &gameVP, bool keep
     cacheNext.assign(current.begin(), current.end());
     // Keep only what is fully off-screen now. Anything (partly) in view is either in this frame's draws already or
     // has moved/vanished: keeping it left trails of walking visitors and other copies along the screen edges.
-    if (keepOld)
-        for (const CTri &t : cacheTris) {
-            if (cacheNext.size() >= CACHE_MAX_TRIS) break;
-            if (screen_class(t, gameVP) == 0) cacheNext.push_back(t);
-        }
+    if (keepOld) {
+        static std::vector<uint8_t> keep;
+        keep.resize(cacheTris.size());
+        par_for(cacheTris.size(), [&](size_t b, size_t e, size_t) { for (size_t i = b; i < e; i++) keep[i] = screen_class(cacheTris[i], gameVP) == 0; });
+        for (size_t i = 0; i < cacheTris.size() && cacheNext.size() < CACHE_MAX_TRIS; i++) if (keep[i]) cacheNext.push_back(cacheTris[i]);
+    }
     cacheTris.swap(cacheNext);
 }
 
@@ -1182,10 +1303,10 @@ static bool read_frame(const TpwShared *sh, Frame &f)
 
 static bool is_additive(const TpwDraw &d) { return d.alphaBlend && d.dstBlend == 2; }   // D3DBLEND_ONE destination: glows / flames
 
-// Build BLAS + TLAS over the triangle soup in the upload buffer (opaque first, then alpha-tested).
+// Build BLAS + TLAS over the triangle soup in soupGpu (opaque first, then alpha-tested; 3 vertices per triangle, no indices).
 static bool build_accel(uint32_t opaqueTris, uint32_t alphaTris, uint32_t &alphaGeom)
 {
-    D3D12_GPU_VIRTUAL_ADDRESS gpu = upload->GetGPUVirtualAddress();
+    D3D12_GPU_VIRTUAL_ADDRESS gpu = upload->GetGPUVirtualAddress(), soup = soupGpu->GetGPUVirtualAddress();
     D3D12_RAYTRACING_GEOMETRY_DESC g[2]{};
     UINT ng = 0;
     uint32_t counts[2] = {opaqueTris, alphaTris};
@@ -1195,10 +1316,9 @@ static bool build_accel(uint32_t opaqueTris, uint32_t alphaTris, uint32_t &alpha
         D3D12_RAYTRACING_GEOMETRY_DESC &d = g[ng++];
         d.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
         d.Flags = i == 0 ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
-        d.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT; d.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-        d.Triangles.IndexCount = counts[i] * 3; d.Triangles.VertexCount = (opaqueTris + alphaTris) * 3;
-        d.Triangles.IndexBuffer = gpu + OFF_RTI + (i == 0 ? 0 : (UINT64)opaqueTris * 12);
-        d.Triangles.VertexBuffer = {gpu + OFF_RTV, sizeof(GpuVertex)};
+        d.Triangles.IndexFormat = DXGI_FORMAT_UNKNOWN; d.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+        d.Triangles.VertexCount = counts[i] * 3;
+        d.Triangles.VertexBuffer = {soup + (i == 0 ? 0 : (UINT64)opaqueTris * 3 * sizeof(GpuVertex)), sizeof(GpuVertex)};
     }
     if (!ng) return false;
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS bi{};
@@ -1212,6 +1332,8 @@ static bool build_accel(uint32_t opaqueTris, uint32_t alphaTris, uint32_t &alpha
     ti.InstanceDescs = gpu + OFF_INST;
     dev->GetRaytracingAccelerationStructurePrebuildInfo(&ti, &pt);
     const auto AS = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE; const auto UF = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (pb.ResultDataMaxSizeInBytes > blasSize || pt.ResultDataMaxSizeInBytes > tlasSize ||
+        std::max(pb.ScratchDataSizeInBytes, pt.ScratchDataSizeInBytes) > scratchSize) gpu_flush();   // the previous frame may still trace the old ones
     if (pb.ResultDataMaxSizeInBytes > blasSize) { blasSize = align(pb.ResultDataMaxSizeInBytes * 3 / 2, 65536); blas = buffer(blasSize, D3D12_HEAP_TYPE_DEFAULT, AS, UF); }
     if (pt.ResultDataMaxSizeInBytes > tlasSize) { tlasSize = align(pt.ResultDataMaxSizeInBytes, 65536); tlas = buffer(tlasSize, D3D12_HEAP_TYPE_DEFAULT, AS, UF); }
     UINT64 sc = std::max(pb.ScratchDataSizeInBytes, pt.ScratchDataSizeInBytes);
@@ -1294,18 +1416,27 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
     TpwShared *sh = nullptr;
     Frame fr;
     std::vector<uint32_t> idxOut;
+    std::vector<GpuVertex> cpuVerts;
     std::vector<CTri> curTris;
     std::vector<Light> lights;
     M4 prevVP{};
     bool havePrev = false, prevRt = false;
     uint32_t rtFrame = 0;
-    DWORD t0 = GetTickCount(), lastTitle = 0, frames = 0;
+    DWORD t0 = GetTickCount(), lastTitle = 0, frames = 0, lastPerf = GetTickCount();
+    uint32_t lastWritten = ~0u, perfGame0 = 0;
+    LARGE_INTEGER qpf; QueryPerformanceFrequency(&qpf);
+    timeBeginPeriod(1);   // Sleep(1) above really sleeps 1 ms
     uint32_t lastGameFrame = 0;
     size_t lastRtTris = 0;
     MSG msg;
     for (;;) {
         while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) { if (msg.message == WM_QUIT) return 0; TranslateMessage(&msg); DispatchMessageA(&msg); }
-        if (game && WaitForSingleObject(game, 0) == WAIT_OBJECT_0) return 0;   // game exited
+        if (game && WaitForSingleObject(game, 0) == WAIT_OBJECT_0) {   // game exited
+            gpu_flush();
+            if (g_panel && IsWindowVisible(g_panel)) settings_save();
+            fprintf(g_log, "game exited\n"); fflush(g_log);
+            TerminateProcess(GetCurrentProcess(), 0);   // ponytail: nothing left to save; skips slow NGX / driver teardown
+        }
         if (!sh) {
             if (!map) map = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, TPWRTX_MAP_NAME);
             if (map) sh = (TpwShared *)MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, 0);
@@ -1332,11 +1463,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
                 fflush(g_log);
             }
         }
-        bool have = read_frame(sh, fr) && fr.hdr.width;
         sh->camZoomMin = S(ST_ZOOMMIN); sh->camZoomMax = S(ST_ZOOMMAX); sh->camWasd = S(ST_WASD) > 0.5f;
         sh->camFov = S(ST_FOV);   // last: the hook starts applying camera options once this is set
         if (GetFileAttributesA("tpwrtx_shot") != INVALID_FILE_ATTRIBUTES) { DeleteFileA("tpwrtx_shot"); g_in.shot = true; }
         read_cmd_file();
+        // Render once per game frame: the overlay only ever shows the newest picture, and repeats of the same game frame
+        // just took GPU time from the game itself (stutter). The free orbit camera animates on its own, so it keeps going.
+        uint32_t written = sh->framesWritten;
+        if (written == lastWritten && !g_in.orbit && !g_in.shot) { Sleep(1); continue; }
+        lastWritten = written;
+        LARGE_INTEGER cpu0; QueryPerformanceCounter(&cpu0);
+        bool have = read_frame(sh, fr) && fr.hdr.width;
         if (g_dumpTex && g_dumpTex <= sh->texCount && sh->tex[g_dumpTex - 1].width) {
             const TpwTexture &tt = sh->tex[g_dumpTex - 1];
             std::vector<uint8_t> px(tt.width * tt.height * 4);
@@ -1348,8 +1485,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
         }
         float t = (GetTickCount() - t0) / 1000.0f;
 
+        // next frame slot: wait only for the frame that used it two frames ago
+        fi = (fi + 1) % FRAMES;
+        if (fence->GetCompletedValue() < frameFence[fi]) { fence->SetEventOnCompletion(frameFence[fi], fenceEvt); WaitForSingleObject(fenceEvt, INFINITE); }
+        graveyard[fi].clear();
+        perf_collect(fi);
+        alloc = allocs[fi]; upload = uploads[fi]; upPtr = upPtrs[fi];
         CHECK(alloc->Reset());
         CHECK(cl->Reset(alloc.Get(), nullptr));
+        tsMask[fi] = 0; ts(TS_START);
         D3D12_GPU_VIRTUAL_ADDRESS gpu = upload->GetGPUVirtualAddress();
         dynUsed = 0;
         ID3D12Resource *lit = nullptr, *litGbuf = nullptr;   // this frame's (denoised) lighting and its G-buffer
@@ -1360,7 +1504,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
         bool rrFresh = rtAvailable && wantRr != rrModeCur;   // new feature: reset its history
         bool rrOn = rtAvailable && rr_update(wantRr);
 
-        if (have && sh->texGeneration != texGen) { for (auto &tc : texCache) tc = TexCache{}; texGen = sh->texGeneration; cacheTris.clear(); }
+        if (have && sh->texGeneration != texGen) { gpu_flush(); for (auto &tc : texCache) tc = TexCache{}; texGen = sh->texGeneration; cacheTris.clear(); }
         UINT64 stageUsed = 0;
         if (have) for (const TpwDraw &d : fr.draws)
             if (d.texId && d.texId <= TPWRTX_MAX_TEX) stageUsed = upload_texture(sh, d.texId, stageUsed);
@@ -1378,16 +1522,20 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
             float l0 = h.camInv[0] * h.camInv[0] + h.camInv[1] * h.camInv[1] + h.camInv[2] * h.camInv[2];
             camOk = fabsf(h.camInv[15] - 1) < 1e-3f && fabsf(l0 - 1) < 1e-2f;
             const float *M = camOk ? h.camInv : kIdent, *V = camOk ? h.view : kIdent;
-            GpuVertex *out = (GpuVertex *)(upPtr + OFF_VB);
-            for (size_t i = 0; i < fr.verts.size(); i++) {
-                const TpwVertex &v = fr.verts[i];
-                GpuVertex &o = out[i];
-                o.color = v.diffuse; o.u = v.u; o.v = v.v;
-                float z = v.rhw > 0 ? h.k / v.rhw : 0, x = (v.x - h.cx) * z / h.f, y = -(v.y - h.cy) * z / h.f;
-                o.x = x * M[0] + y * M[4] + z * M[8] + M[12];
-                o.y = x * M[1] + y * M[5] + z * M[9] + M[13];
-                o.z = x * M[2] + y * M[6] + z * M[10] + M[14];
-            }
+            // built in cached memory (it is read back below), copied to the upload heap once at the end
+            cpuVerts.resize(fr.verts.size());
+            GpuVertex *out = cpuVerts.data();
+            par_for(fr.verts.size(), [&](size_t b, size_t e, size_t) {
+                for (size_t i = b; i < e; i++) {
+                    const TpwVertex &v = fr.verts[i];
+                    GpuVertex &o = out[i];
+                    o.color = v.diffuse; o.u = v.u; o.v = v.v;
+                    float z = v.rhw > 0 ? h.k / v.rhw : 0, x = (v.x - h.cx) * z / h.f, y = -(v.y - h.cy) * z / h.f;
+                    o.x = x * M[0] + y * M[4] + z * M[8] + M[12];
+                    o.y = x * M[1] + y * M[5] + z * M[9] + M[13];
+                    o.z = x * M[2] + y * M[6] + z * M[10] + M[14];
+                }
+            });
             for (const TpwDraw &d : fr.draws) {
                 bool isUI = (d.flags & TPW_DRAW_UI) != 0;
                 if (d.firstVertex + d.numVertices > fr.verts.size() || d.firstIndex + d.numIndices > fr.idx.size()) continue;
@@ -1444,6 +1592,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
                 (isUI ? ui : world).push_back({&d, first, (UINT)idxOut.size() - first, rtGeom});
             }
             if (g_dumpDraws) { g_dumpDraws = false; fflush(g_log); }
+            memcpy(upPtr + OFF_VB, cpuVerts.data(), cpuVerts.size() * sizeof(GpuVertex));
             memcpy(upPtr + OFF_IB, idxOut.data(), idxOut.size() * 4);
             gameVP = mul(from16(V), proj_game(h.f, h.cx, h.cy, (float)h.width, (float)h.height));
             viewM = g_in.orbit ? orbit_view(M, t) : from16(V);
@@ -1457,20 +1606,38 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
         if (doRt) {
             update_cache(curTris, gameVP, g_in.cache);
             // triangle soup: opaque first, then alpha-tested
+            // triangle soup, opaque first then alpha-tested, written by all cores into the upload heap
             GpuVertex *rv = (GpuVertex *)(upPtr + OFF_RTV);
-            uint32_t *ri = (uint32_t *)(upPtr + OFF_RTI), *rm = (uint32_t *)(upPtr + OFF_MAT), nTri = 0, opaque = 0;
-            for (int pass = 0; pass < 2; pass++)
-                for (const CTri &c : cacheTris) {
-                    if (((c.mat[0] & 0x10000) != 0) != (pass == 1) || nTri >= RT_MAX_TRIS) continue;
-                    memcpy(rv + nTri * 3, c.v, sizeof c.v);
-                    ri[nTri * 3] = nTri * 3; ri[nTri * 3 + 1] = nTri * 3 + 1; ri[nTri * 3 + 2] = nTri * 3 + 2;
-                    rm[nTri * 2] = c.mat[0]; rm[nTri * 2 + 1] = c.mat[1];
-                    nTri++; if (pass == 0) opaque++;
+            uint32_t *rm = (uint32_t *)(upPtr + OFF_MAT);
+            size_t nAll = std::min<size_t>(cacheTris.size(), RT_MAX_TRIS), nc = (nAll + PAR_CHUNK - 1) / PAR_CHUNK;
+            static std::vector<uint32_t> chunkOpaque, chunkBase;   // per chunk: opaque count, then where its opaque / alpha triangles go
+            chunkOpaque.assign(nc + 1, 0); chunkBase.assign(2 * nc + 2, 0);
+            par_for(nAll, [&](size_t b, size_t e, size_t c) { uint32_t n = 0; for (size_t i = b; i < e; i++) n += !(cacheTris[i].mat[0] & 0x10000); chunkOpaque[c] = n; });
+            uint32_t opaque = 0, nTri = (uint32_t)nAll;
+            for (size_t c = 0; c < nc; c++) { chunkBase[2 * c] = opaque; opaque += chunkOpaque[c]; }
+            for (size_t c = 0, a = opaque; c < nc; c++) { chunkBase[2 * c + 1] = (uint32_t)a; a += std::min(nAll, (c + 1) * PAR_CHUNK) - c * PAR_CHUNK - chunkOpaque[c]; }
+            par_for(nAll, [&](size_t b, size_t e, size_t c) {
+                uint32_t o = chunkBase[2 * c], a = chunkBase[2 * c + 1];
+                for (size_t i = b; i < e; i++) {
+                    const CTri &t = cacheTris[i];
+                    uint32_t d = (t.mat[0] & 0x10000) ? a++ : o++;
+                    memcpy(rv + d * 3, t.v, sizeof t.v);
+                    rm[d * 2] = t.mat[0]; rm[d * 2 + 1] = t.mat[1];
                 }
+            });
+            if (nTri) {   // into video memory: the BLAS build and every ray hit read it from there
+                if (soupState != D3D12_RESOURCE_STATE_COPY_DEST) transition(soupGpu.Get(), soupState, D3D12_RESOURCE_STATE_COPY_DEST);
+                cl->CopyBufferRegion(soupGpu.Get(), 0, upload.Get(), OFF_RTV, (UINT64)nTri * 3 * sizeof(GpuVertex));
+                cl->CopyBufferRegion(soupGpu.Get(), SOUP_MAT, upload.Get(), OFF_MAT, (UINT64)nTri * 8);
+                transition(soupGpu.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                soupState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            }
             lastRtTris = nTri;
             memcpy(upPtr + OFF_LIGHT, lights.data(), lights.size() * sizeof(Light));
             uint32_t alphaGeom = 1;
-            if (build_accel(opaque, nTri - opaque, alphaGeom)) {
+            bool built = build_accel(opaque, nTri - opaque, alphaGeom);
+            ts(TS_ACCEL);
+            if (built) {
                 RTConsts k{};
                 M4 inv = inverse(vp);
                 memcpy(k.invViewProj, inv.m, 64); memcpy(k.viewProj, vp.m, 64); memcpy(k.prevViewProj, (havePrev ? prevVP : vp).m, 64);
@@ -1509,14 +1676,16 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
                 cl->SetPipelineState(rtPso.Get());
                 cl->SetComputeRootConstantBufferView(0, gpu + OFF_CB + 256);
                 cl->SetComputeRootShaderResourceView(1, tlas->GetGPUVirtualAddress());
-                cl->SetComputeRootShaderResourceView(2, gpu + OFF_RTV);
-                cl->SetComputeRootShaderResourceView(3, gpu + OFF_RTI);
-                cl->SetComputeRootShaderResourceView(4, gpu + OFF_MAT);
+                D3D12_GPU_VIRTUAL_ADDRESS soup = soupGpu->GetGPUVirtualAddress();
+                cl->SetComputeRootShaderResourceView(2, soup);
+                cl->SetComputeRootShaderResourceView(3, soup);   // t2: unused since the soup has no index buffer
+                cl->SetComputeRootShaderResourceView(4, soup + SOUP_MAT);
                 cl->SetComputeRootShaderResourceView(5, gpu + OFF_LIGHT);
                 cl->SetComputeRootDescriptorTable(6, gpu_desc(0));
                 cl->SetComputeRootDescriptorTable(7, gpu_desc(HEAP_RT + p * RT_UAVS));
                 cl->Dispatch((rw + 7) / 8, (rh + 7) / 8, 1);
                 uav_barrier(accum[p].Get()); uav_barrier(gbuf[p].Get());
+                ts(TS_RT);
                 lit = accum[p].Get(); litGbuf = gbuf[p].Get();
                 depthScale[0] = (float)rw / WIN_W; depthScale[1] = (float)rh / WIN_H;
                 if (rrOn) {   // DLSS Ray Reconstruction: guides -> clean HDR image at output size
@@ -1544,12 +1713,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
                     uav_barrier(rrOut.Get());
                     lit = rrOut.Get();   // output size; depth stays at render size (depthScale)
                 }
+                ts(TS_RR);
                 // own denoiser on the lighting (never fed back into the history, which stays per-pixel)
                 cl->SetComputeRootSignature(atrousRootSig.Get());
                 cl->SetPipelineState(atrousPso.Get());
                 for (int i = 0; i < (rrOn ? 0 : (int)S(ST_DENOISE)); i++) {
                     ID3D12Resource *out = dn[i & 1].Get();
-                    UINT tbl = HEAP_DYN + dynUsed; dynUsed += 3;
+                    UINT tbl = dyn_alloc(3);
                     make_uav(lit, tbl, DXGI_FORMAT_R16G16B16A16_FLOAT); make_uav(out, tbl + 1, DXGI_FORMAT_R16G16B16A16_FLOAT);
                     make_uav(litGbuf, tbl + 2, DXGI_FORMAT_R32G32B32A32_UINT);
                     float sg = S(ST_DNSMOOTH);
@@ -1583,7 +1753,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
         cl->SetDescriptorHeaps(1, heaps);
         cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         if (doRt) {
-            UINT tbl = HEAP_DYN + dynUsed; dynUsed += 3;
+            UINT tbl = dyn_alloc(3);
             make_srv(lit, tbl, DXGI_FORMAT_R16G16B16A16_FLOAT); make_srv(rtDepthTex.Get(), tbl + 1, DXGI_FORMAT_R32_FLOAT);
             make_srv(litGbuf, tbl + 2, DXGI_FORMAT_R32G32B32A32_UINT);
             cl->SetGraphicsRootSignature(compRootSig.Get());
@@ -1593,13 +1763,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
                             depthScale[0], depthScale[1], 0, 0};
             cl->SetGraphicsRoot32BitConstants(1, 12, kc, 0);
             cl->DrawInstanced(3, 1, 0, 0);
+            ts(TS_COMP);
             for (ID3D12Resource *r : {lit, rtDepthTex.Get(), litGbuf}) transition(r, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             // DLSS 5 on the finished frame, before water, smoke and the UI are drawn on top (the model never sees them)
             if (S(ST_NR) > 0.5f && nr_load() && nr_ready()) {
-                nr_pass(backbuf[bi].Get(), frameRw, frameRh, frameReset);
+                nr_pass(backbuf[bi].Get(), rtv, dsv, frameRw, frameRh, frameReset);
                 cl->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
                 cl->RSSetViewports(1, &vpt); cl->RSSetScissorRects(1, &sc);
             }
+            ts(TS_NR);
         }
         cl->SetGraphicsRootSignature(rootSig.Get());
         cl->SetGraphicsRootConstantBufferView(0, gpu + OFF_CB);
@@ -1635,6 +1807,11 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
             if (toGame) cl->CopyResource(outTex.Get(), backbuf[bi].Get());   // simultaneous-access texture: no transitions needed
             transition(backbuf[bi].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
         } else transition(backbuf[bi].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+        bool rtFrame = (tsMask[fi] & (1u << TS_NR)) != 0;
+        for (UINT k = TS_ACCEL; k < TS_END; k++) if (!(tsMask[fi] & (1u << k))) ts(k);   // stages skipped this frame: zero length
+        ts(TS_END);
+        cl->ResolveQueryData(tsHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, fi * TS_N, TS_N, tsReadback.Get(), fi * TS_N * 8ull);
+        tsUsed[fi] = rtFrame;   // only ray-traced frames go into the GPU averages
         CHECK(cl->Close());
         ID3D12CommandList *lists[] = {cl.Get()};
         queue->ExecuteCommandLists(1, lists);
@@ -1644,11 +1821,22 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int)
             MemoryBarrier();
             sh->outFenceValue = outFenceVal;
         }
-        HRESULT pr = swap->Present(1, 0);
-        if (FAILED(pr)) fail("Present", pr == DXGI_ERROR_DEVICE_REMOVED ? dev->GetDeviceRemovedReason() : pr);
+        if (!g_overlay) {   // overlay mode: the hook shows outTex; presenting the hidden window only added a vsync wait
+            HRESULT pr = swap->Present(1, 0);
+            if (FAILED(pr)) fail("Present", pr == DXGI_ERROR_DEVICE_REMOVED ? dev->GetDeviceRemovedReason() : pr);
+        }
         queue->Signal(fence.Get(), ++fenceVal);
-        fence->SetEventOnCompletion(fenceVal, fenceEvt); WaitForSingleObject(fenceEvt, INFINITE);   // ponytail: one frame in flight; plenty for this load
+        frameFence[fi] = fenceVal;   // no wait: the next frame is built while this one renders
+        {
+            LARGE_INTEGER cpu1; QueryPerformanceCounter(&cpu1);
+            perfCpu += (cpu1.QuadPart - cpu0.QuadPart) * 1000.0 / qpf.QuadPart; perfFrames++; perfRtTris = (uint32_t)lastRtTris;
+            if (GetTickCount() - lastPerf >= 5000) {
+                perf_log(sh->framesWritten - perfGame0, (GetTickCount() - lastPerf) / 1000.0);
+                lastPerf = GetTickCount(); perfGame0 = sh->framesWritten;
+            }
+        }
         if (shot) {
+            gpu_flush();   // the screenshot copy is in the frame just submitted
             uint8_t *p; D3D12_RANGE rr{0, (SIZE_T)WIN_W * WIN_H * 4};
             if (SUCCEEDED(readback->Map(0, &rr, (void **)&p))) { write_png("tpwrtx_view.png", WIN_W, WIN_H, p, WIN_W * 4); D3D12_RANGE none{0, 0}; readback->Unmap(0, &none); }
             g_in.shot = false;

@@ -95,12 +95,64 @@ static volatile DWORD g_renderTid;
 /* In-park slowdown diagnosis: count exceptions by code (a floating-point trap storm would show up here). */
 static volatile LONG g_excFlt, g_excOther;
 static volatile DWORD g_excLastCode;
+/* "module+offset" for a code address (or "?" outside any module) */
+static void where(DWORD addr, char *out, int n)
+{
+    HMODULE m = NULL;
+    char path[MAX_PATH], *base;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(UINT_PTR)addr, &m) &&
+        GetModuleFileNameA(m, path, sizeof path)) {
+        base = strrchr(path, '\\');
+        _snprintf(out, n, "%s+0x%lx", base ? base + 1 : path, addr - (DWORD)(UINT_PTR)m);
+    } else _snprintf(out, n, "? (no module)");
+    out[n - 1] = 0;
+}
+
+/* Crash report: every access violation is logged with registers and the return addresses found on the stack, and the
+ * first one not raised inside KernelBase (IsBadReadPtr probes fault there on purpose) also gets tphook_crash.dmp for
+ * cdb/WinDbg. Observe only: the game's own handling carries on as before. */
+typedef BOOL (WINAPI *MDWD_t)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
+static volatile LONG g_avLogged, g_dumped;
+static void crash_report(EXCEPTION_POINTERS *e)
+{
+    EXCEPTION_RECORD *er = e->ExceptionRecord;
+    CONTEXT *c = e->ContextRecord;
+    char at[96], tgt[96];
+    DWORD *sp = (DWORD *)(UINT_PTR)c->Esp, i, found = 0;
+    if (InterlockedIncrement(&g_avLogged) > 20 || !g_log) return;
+    where((DWORD)(UINT_PTR)er->ExceptionAddress, at, sizeof at);
+    where(c->Eip, tgt, sizeof tgt);
+    logf_("[crash] %08lx at %s, thread %lu, %s address %08lx | eip %08lx eax %08lx ebx %08lx ecx %08lx edx %08lx esi %08lx edi %08lx ebp %08lx esp %08lx\n",
+          er->ExceptionCode, at, GetCurrentThreadId(), er->NumberParameters >= 2 ? (er->ExceptionInformation[0] == 8 ? "executing" : er->ExceptionInformation[0] ? "writing" : "reading") : "?",
+          er->NumberParameters >= 2 ? (DWORD)er->ExceptionInformation[1] : 0, c->Eip, c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp);
+    __try {
+        for (i = 0; i < 2048 && found < 16; i++) {   /* stack words that point into a module = likely return addresses */
+            HMODULE m;
+            if (sp[i] > 0x10000 && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(UINT_PTR)sp[i], &m)) {
+                where(sp[i], tgt, sizeof tgt); logf_("[crash]   stack+%03lx: %s\n", i * 4, tgt); found++;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    fflush(g_log);
+    if (!strstr(at, "KERNELBASE") && !strstr(at, "KernelBase") && !InterlockedExchange(&g_dumped, 1)) {
+        MDWD_t mdwd = (MDWD_t)GetProcAddress(LoadLibraryA("dbghelp.dll"), "MiniDumpWriteDump");
+        HANDLE f = CreateFileA("tphook_crash.dmp", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        struct { DWORD tid; EXCEPTION_POINTERS *ep; BOOL client; } mei = {GetCurrentThreadId(), e, FALSE};
+        if (mdwd && f != INVALID_HANDLE_VALUE)   /* MiniDumpWithDataSegs | WithIndirectlyReferencedMemory | WithThreadInfo */
+            logf_("[crash] minidump %s: tphook_crash.dmp\n", mdwd(GetCurrentProcess(), GetCurrentProcessId(), f, 0x1 | 0x40 | 0x1000, &mei, NULL, NULL) ? "written" : "FAILED");
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+        fflush(g_log);
+    }
+}
+
 static LONG CALLBACK count_exceptions(EXCEPTION_POINTERS *e)
 {
     DWORD code = e->ExceptionRecord->ExceptionCode;
     if ((code >= 0xC000008D && code <= 0xC0000093) || code == 0xC00002B4 || code == 0xC00002B5) InterlockedIncrement(&g_excFlt);
     else InterlockedIncrement(&g_excOther);
     g_excLastCode = code;
+    if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION ||
+        code == 0xC0000374 /* heap corruption */) crash_report(e);
     return EXCEPTION_CONTINUE_SEARCH;   /* observe only */
 }
 
@@ -1224,8 +1276,10 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r)
         patch_iat();
         fflush(g_log);
     } else if (reason == DLL_PROCESS_DETACH && g_log) {
+        FILE *f = g_log;
         logf_("detach at frame %lu\n", g_frame);
-        fclose(g_log);
+        g_log = NULL;   /* the exception logger may still run during shutdown */
+        fclose(f);
     }
     return TRUE;
 }

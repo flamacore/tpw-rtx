@@ -68,7 +68,20 @@ Two denoising paths:
   then an edge-aware à-trous wavelet filter. Textures stay sharp because only the lighting is blurred.
 
 The composite applies ACES tone mapping, then contrast and saturation. The optional DLSS 5 pass runs here, before the raster passes
-(water, smoke, UI) are drawn on top.
+(water, smoke, UI) are drawn on top. It works on a scaled-down copy of the frame (the DLSS 5 resolution setting), and its picture is
+scaled back up in the blend.
+
+## Keeping up with the game
+
+The renderer only ever needs to deliver the newest picture, and only as often as the game draws:
+
+- It renders once per game frame. Rendering the same game frame again only took GPU time away from the game.
+- Two frames are in flight. The CPU rebuilds frame N+1 (vertices back to world space, the off-screen cache, the triangle list)
+  while the GPU renders frame N. Each frame slot has its own upload buffer, command allocator and descriptor block, and anything the
+  GPU may still be reading is only released once it has finished.
+- The triangle list is written by all CPU cores, then copied once per frame into video memory. The acceleration structure is built
+  from there, and ray hits and alpha tests read it there, instead of fetching vertices across PCIe millions of times per frame.
+- GPU timestamps around each stage feed the `perf:` line in `tpwrtx_viewer.log`.
 
 ## Presenting it
 
@@ -89,6 +102,10 @@ units) and adds a gold arrow to the stream.
 | Software rendering under dxwrapper | `GetAvailableVidMem` with empty caps fails, so the game decides it's out of VRAM. | Report 256 MB. |
 | Mouse frozen after alt-tab | The mouse is read through DirectInput **event notification**: the game sleeps until DirectInput signals input. After Windows takes the device away, no event ever fires again. | Remember the devices the game acquired, and re-acquire them whenever the game has focus. |
 | Stretched 16:9 window | The game sizes its window to the full screen. | Keep the client area at 4:3; DPI-aware. |
+
+When the game crashes, the hook writes a `[crash]` report to `tphook.log`: the faulting module and offset, the registers, and the
+return addresses found on the stack. It also saves `tphook_crash.dmp` for WinDbg or cdb. Faults inside KernelBase are skipped,
+because old programs probe memory there on purpose.
 
 ## Settings panel without pausing the game
 

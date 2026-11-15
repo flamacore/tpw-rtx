@@ -115,7 +115,7 @@ Settings save automatically to `tpwrtx_settings.json` in the game folder. **Defa
 | Materials | vertex colour tint, baked game shading, bumps from textures, sun highlights, glossiness |
 | Own denoiser | passes, smoothing, temporal frames, TAA jitter (only used when DLSS Ray Reconstruction is off) |
 | DLSS | Ray Reconstruction: off / DLAA / Quality / Balanced / Performance |
-| DLSS 5 | on/off, detail strength, colour strength, highlight guard, style, model preset, intensity, local structure, local tone |
+| DLSS 5 | on/off, detail strength, colour strength, highlight guard, style, model preset, intensity, local structure, local tone, resolution |
 | Camera | FOV (90 = original), closest zoom (70 = original), farthest zoom (130 = original), WASD pan + Q/E rotate on/off |
 
 **Camera notes:** the game tilts the camera with the zoom, so zooming in also lowers the view and zooming far out turns it almost
@@ -126,8 +126,19 @@ toolbar buttons still work.
 `tpwrtx.ini`. The game then renders at that size with a wider field of view, and mouse picking is adjusted to match. The game's
 interface was made for 4:3 and isn't laid out for other shapes, so expect some oddities there. Remove the line to go back.
 
-**Performance:** the renderer draws at the game window's height (`height = auto` in `tpwrtx.ini`). If it's too slow, choose
-DLSS **Quality** or **Performance** in the panel, or set a lower fixed `height`, such as `1080`.
+**Performance:** the renderer draws at the game window's height (`height = auto` in `tpwrtx.ini`). The two DLSS passes are by far
+the most expensive part. On an RTX 4080 SUPER at 3640×2048:
+
+| Setting | GPU time per frame |
+|---|---|
+| DLSS Ray Reconstruction, DLAA | 12 ms |
+| DLSS Ray Reconstruction, **Quality** | 5.5 ms |
+| DLSS 5 at 100% resolution | 17 ms |
+| DLSS 5 at **67%** resolution (default) | 8.6 ms |
+
+So for smooth camera movement with everything on, use DLSS RR **Quality** and leave DLSS 5 at **67%**. That comes to about
+16 ms per frame, or 60 fps, at that size. If it's still too slow, try DLSS **Performance** or a lower fixed `height`, such as
+`1440`. Every 5 seconds `tpwrtx_viewer.log` records a `perf:` line with the frame rate and what each stage costs.
 
 ## Troubleshooting
 
@@ -139,6 +150,8 @@ DLSS **Quality** or **Performance** in the panel, or set a lower fixed `height`,
 | Flat, pixelated picture | The game is in software mode: delete `save\Config.tcf`. |
 | Stretched picture | The hook keeps the window at 4:3; give it a second after start-up. |
 | DLSS rows do nothing | Check that `nvngx_dlssd.dll` is in the game folder. `tpwrtx_viewer.log` says "DLSS Ray Reconstruction: available". |
+| Choppy when the camera moves | Read the `perf:` lines in `tpwrtx_viewer.log`. If the renderer's fps is below the game's, see **Performance** above. |
+| The game crashed | `tphook.log` has a `[crash]` report and the game folder has `tphook_crash.dmp`. Please attach both to a [GitHub issue](https://github.com/flamacore/tpw-rtx/issues). |
 
 **Uninstall:** delete the tpw-rtx files listed above, plus `ddraw.dll` and `dxwrapper.dll`, and restore anything from the
 `tpw-rtx-backup` folder. The original install in Program Files was never touched.
